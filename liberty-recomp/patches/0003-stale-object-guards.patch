@@ -21,10 +21,30 @@ index b8ac050..7ec229d 100644
  	r31.u64 = REX_LOAD_U32(r30.u32 + 60);
  	// cmplwi cr6,r31,0
 diff --git a/glue/rexglue-sdk-main/gta4-recomp/generated/gta4_recomp.78.cpp b/glue/rexglue-sdk-main/gta4-recomp/generated/gta4_recomp.78.cpp
-index b97c7bf..7cf5d60 100644
+index b97c7bf..2ef0f1d 100644
 --- a/glue/rexglue-sdk-main/gta4-recomp/generated/gta4_recomp.78.cpp
 +++ b/glue/rexglue-sdk-main/gta4-recomp/generated/gta4_recomp.78.cpp
-@@ -3757,6 +3757,11 @@ loc_8297D224:
+@@ -1,6 +1,7 @@
+ #include "gta4_init.h"
+ #if defined(__ANDROID__)
+ extern "C" bool GTA4_StaleChildGuard(uint32_t child);
++extern "C" bool GTA4_StaleObjectReadable(uint32_t address, uint32_t bytes, const char* site);
+ #endif
+ 
+ DEFINE_REX_FUNC(sub_8297BBC0) {
+@@ -3708,6 +3709,11 @@ loc_8297D1F4:
+ 	// mr r10,r11
+ 	ctx.r10.u64 = ctx.r11.u64;
+ loc_8297D1F8:
++#if defined(__ANDROID__)
++	// Hand edit (TKPL2): a freed node in the r26 walk ends the walk the way the
++	// title ends it (both cursors met) instead of faulting at +172.
++	if (r26.u32 && !GTA4_StaleObjectReadable(r26.u32, 700, "sub_8297CE78/r26")) goto loc_8297D490;
++#endif
+ 	// cmplwi cr6,r26,0
+ 	cr6.compare<uint32_t>(r26.u32, 0, xer);
+ 	// beq cr6,0x8297d25c
+@@ -3757,6 +3763,11 @@ loc_8297D224:
  	ctx.r10.u64 = __builtin_rotateleft64(ctx.r10.u32 | (ctx.r10.u64 << 32), 2) & 0xFFFFFFFC;
  	// lwzx r27,r10,r11
  	r27.u64 = REX_LOAD_U32(ctx.r10.u32 + ctx.r11.u32);

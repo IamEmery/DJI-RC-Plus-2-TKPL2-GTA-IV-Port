@@ -15,6 +15,7 @@ following.
 | `sub_8297CE78`, `lwz r28,100(r24)` right after upstream's guard said "readable" | The guest heap page table called the page readable, but the host page was not | `PageReadable` in `gta4-recomp/src/android/android_stale_object_guard.cpp` now confirms with the kernel through `process_vm_readv` (once per cached page, so no measurable cost) |
 | `sub_8297AF90`, `lwz r31,60(r30)` | stale child from the table at object+48+648 | hand edit in `generated/gta4_recomp.77.cpp`: `GTA4_StaleObjectReadable(r30+60)`, otherwise the title's "no object" path |
 | `sub_8297CE78`, second child-table walk (r27), read at +100 | same race as upstream's r24 walk | hand edit in `generated/gta4_recomp.78.cpp`: the same guard as upstream's, taking the empty-table path |
+| `sub_8297CE78`, node walk (r26), `lwz r9,124(r26+48)` | the current node of the scene walk was freed by another thread | hand edit in `generated/gta4_recomp.78.cpp` at `loc_8297D1F8`: if r26..r26+700 is not readable, jump to `loc_8297D490`, where the title ends the walk itself when both cursors meet. Clearing r26 instead would loop forever |
 | `sub_8296B0E8` (from `sub_8296E638`), `stvx` to r3+144 | **write** fault on a page that is readable but not writable | **open:** needs the fault address from a crash report |
 
 The generated-code edits are marked `Hand edit (TKPL2)`. They should become entries in upstream's
