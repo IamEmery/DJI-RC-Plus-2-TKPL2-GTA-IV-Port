@@ -1,12 +1,13 @@
 diff --git a/os/android/app/src/main/java/com/libertyrecomp/LibertyActivity.java b/os/android/app/src/main/java/com/libertyrecomp/LibertyActivity.java
-index a05ae52..646b7fe 100644
+index a05ae52..966202e 100644
 --- a/os/android/app/src/main/java/com/libertyrecomp/LibertyActivity.java
 +++ b/os/android/app/src/main/java/com/libertyrecomp/LibertyActivity.java
-@@ -9,9 +9,11 @@ import android.os.Bundle;
+@@ -9,9 +9,12 @@ import android.os.Bundle;
  import android.system.ErrnoException;
  import android.system.Os;
  import android.util.Log;
 +import android.view.KeyEvent;
++import android.view.MotionEvent;
  import android.view.View;
  import android.view.WindowManager;
  
@@ -14,7 +15,7 @@ index a05ae52..646b7fe 100644
  import org.libsdl.app.SDLActivity;
  import org.libsdl.app.SDLSurface;
  
-@@ -86,10 +88,26 @@ public class LibertyActivity extends SDLActivity {
+@@ -86,10 +89,33 @@ public class LibertyActivity extends SDLActivity {
      private boolean mDebugLog;
      private File mDebugLogFile;
  
@@ -32,6 +33,13 @@ index a05ae52..646b7fe 100644
 +        return super.dispatchKeyEvent(event);
 +    }
 +
++    @Override
++    public boolean dispatchGenericMotionEvent(MotionEvent event) {
++        // The RC's own USB gamepad: its sticks and wheels feed the bridge.
++        if (DjiRcJoystickHandler.onGenericMotion(event)) return true;
++        return super.dispatchGenericMotionEvent(event);
++    }
++
      @Override
      protected void onCreate(Bundle savedInstanceState) {
          prepareEnvironment();
@@ -43,14 +51,16 @@ index a05ae52..646b7fe 100644
          // Steady clocks the device can hold, instead of peaks followed by
 diff --git a/os/android/app/src/main/java/org/libsdl/app/DjiRcJoystickHandler.java b/os/android/app/src/main/java/org/libsdl/app/DjiRcJoystickHandler.java
 new file mode 100644
-index 0000000..9465e4d
+index 0000000..ce35a47
 --- /dev/null
 +++ b/os/android/app/src/main/java/org/libsdl/app/DjiRcJoystickHandler.java
-@@ -0,0 +1,435 @@
+@@ -0,0 +1,536 @@
 +package org.libsdl.app;
 +
 +import android.util.Log;
++import android.view.InputDevice;
 +import android.view.KeyEvent;
++import android.view.MotionEvent;
 +
 +import java.io.IOException;
 +import java.io.InputStream;
@@ -62,15 +72,18 @@ index 0000000..9465e4d
 +/**
 + * Exposes the built-in controls of a DJI RC Plus 2 as an SDL gamepad.
 + *
-+ * The sticks, wheels and most buttons never reach Android's input system on
-+ * this controller (its "DJI Virtual Joystick" HID stays silent). The DJI
-+ * system service publishes them instead as DUML packets (cmd_set 0x06,
-+ * cmd_id 0xAE) on 127.0.0.1:40007 for as long as a client keeps sending a
-+ * keepalive. The six top buttons (L1-L3, R1-R3) arrive separately as F1-F6
++ * The DJI system service publishes the sticks, wheels and most buttons as
++ * DUML packets (cmd_set 0x06, cmd_id 0xAE) on 127.0.0.1:40007 for as long as
++ * a client keeps sending a keepalive, but only about 10 per second. The
++ * controller's own USB gamepad ("DJI Virtual Joystick", 2ca3:1501, xpad)
++ * reports the sticks and back wheels at ~60 Hz while they move, so those axes
++ * come from it; DUML supplies the buttons and is the fallback for any axis the
++ * gamepad stops tracking (see onFastMotion and checkFastAxes). The six top buttons (L1-L3, R1-R3) arrive separately as F1-F6
 + * key events from gpio-keys and are forwarded by LibertyActivity.
 + *
 + * Layout (Xbox 360): sticks -> sticks, left/right back wheel -> LT/RT,
-+ * C2/C1/C3/R1 -> A/X/B/Y, L1 -> LB, shutter (full) -> RB, 5D -> D-pad and
++ * C2/C1/R1 -> A/X/Y, C3 -> RB, L1 -> LB, R2 -> B, shutter half -> LT (aim) and
++ * full -> LT + RT (fire), 5D -> D-pad and
 + * its press -> L3, L2 -> R3, top-right wheel -> D-pad left/right,
 + * Pause -> Start, RTH -> Back.
 + */
@@ -127,6 +140,22 @@ index 0000000..9465e4d
 +    private int mFrames, mOtherFrames;
 +    private long mNextStatusLog;
 +
++    // Fast axes from the USB gamepad, in SDL order (lx, ly, rx, ry, lt, rt).
++    // An axis is "fast" while the gamepad tracks it; DUML then skips it.
++    private static final int EMBEDDED_PRODUCT_ID = 0x1501;
++    private static final int[] FAST_SOURCE = {
++        MotionEvent.AXIS_X, MotionEvent.AXIS_Y, MotionEvent.AXIS_RX, MotionEvent.AXIS_RY,
++        MotionEvent.AXIS_Z, MotionEvent.AXIS_RZ,
++    };
++    private static final float FAST_MISMATCH = 0.25f;
++    private static final int FAST_MISMATCH_REPORTS = 4;     // DUML reports (~400 ms)
++    private static final long FAST_BACKOFF_MS = 2000;
++    private final float[] mFast = new float[6];
++    private final boolean[] mFastSeen = new boolean[6];
++    private final int[] mFastMismatch = new int[6];
++    private final long[] mFastBackoffUntil = new long[6];
++    private int mFastEvents, mFastFallbacks;
++
 +    /** Replaces SDL's joystick handler; call after SDLActivity.onCreate. */
 +    public static void install() {
 +        if (sInstance != null) return;
@@ -145,7 +174,7 @@ index 0000000..9465e4d
 +            case KeyEvent.KEYCODE_F2: bit = 1 << R3; break;   // L2
 +            case KeyEvent.KEYCODE_F3: bit = 0; break;          // L3 (free)
 +            case KeyEvent.KEYCODE_F4: bit = 1 << Y; break;    // R1
-+            case KeyEvent.KEYCODE_F5: bit = 0; break;          // R2 (free)
++            case KeyEvent.KEYCODE_F5: bit = 1 << B; break;    // R2
 +            case KeyEvent.KEYCODE_F6: bit = 0; break;          // R3 (free)
 +            default: return false;
 +        }
@@ -241,14 +270,15 @@ index 0000000..9465e4d
 +    }
 +
 +    /**
-+     * Hides the controller's own "DJI Virtual Joystick" (2ca3:1501). It never
-+     * reports anything, but as a real gamepad it would take player slot 0.
++     * Hides the controller's own "DJI Virtual Joystick" (2ca3:1501) from SDL:
++     * as a real gamepad it would take player slot 0. Its motion events are
++     * read by handleMotionEvent instead.
 +     */
 +    @Override
 +    void deviceAdded(int device_id) {
 +        android.view.InputDevice device = android.view.InputDevice.getDevice(device_id);
-+        if (device != null && device.getVendorId() == VENDOR_ID && device.getProductId() == 0x1501) {
-+            Log.i(TAG, "ignoring silent " + device.getName());
++        if (isEmbeddedGamepad(device)) {
++            Log.i(TAG, "fast axes from " + device.getName());
 +            return;
 +        }
 +        super.deviceAdded(device_id);
@@ -297,8 +327,10 @@ index 0000000..9465e4d
 +                mNextStatusLog = now + 5000;
 +                Log.i(TAG, "status: rc frames=" + mFrames + " other=" + mOtherFrames
 +                        + " axes=" + java.util.Arrays.toString(mAxes) + " buttons=0x"
-+                        + Integer.toHexString(mDumlButtons | mTopKeys));
-+                mFrames = mOtherFrames = 0;
++                        + Integer.toHexString(mDumlButtons | mTopKeys)
++                        + " fast events=" + mFastEvents + " fallbacks=" + mFastFallbacks
++                        + " fast=" + java.util.Arrays.toString(mFast));
++                mFrames = mOtherFrames = mFastEvents = mFastFallbacks = 0;
 +            }
 +            int n;
 +            try {
@@ -367,19 +399,25 @@ index 0000000..9465e4d
 +        float lv = axis(b, p + 9), lh = axis(b, p + 11);
 +        float lw = axis(b, p + 13), rw = axis(b, p + 15);
 +        // SDL: Y grows downwards; triggers run from -1 (released) to 1.
-+        setAxis(0, lh);
-+        setAxis(1, -lv);
-+        setAxis(2, rh);
-+        setAxis(3, -rv);
-+        setAxis(4, Math.abs(lw) * 2f - 1f);
-+        setAxis(5, Math.abs(rw) * 2f - 1f);
++        float[] duml = { lh, -lv, rh, -rv, Math.abs(lw) * 2f - 1f, Math.abs(rw) * 2f - 1f };
++        long now = System.currentTimeMillis();
++        for (int i = 0; i < 6; i++) {
++            if (!fastActive(i, duml[i], now)) setAxis(i, duml[i]);
++        }
 +
 +        int b0 = b[p] & 0xFF, b1 = b[p + 1] & 0xFF, b2 = b[p + 2] & 0xFF, wheel = b[p + 4] & 0xFF;
 +        int state = 0;
 +        if ((b2 & 0x08) != 0) state |= 1 << A;      // C2
 +        if ((b2 & 0x04) != 0) state |= 1 << X;      // C1
-+        if ((b2 & 0x10) != 0) state |= 1 << B;      // C3
-+        if ((b0 & 0x40) != 0) state |= 1 << RB;     // shutter, full press
++        if ((b2 & 0x10) != 0) state |= 1 << RB;     // C3
++        // Shutter: half press aims (LT), full press also fires (RT).
++        boolean half = (b0 & 0xC0) != 0, full = (b0 & 0x40) != 0;
++        if (half != mShutterHalf || full != mShutterFull) {
++            mShutterHalf = half;
++            mShutterFull = full;
++            setAxis(4, mRawAxes[4]);
++            setAxis(5, mRawAxes[5]);
++        }
 +        if ((b0 & 0x10) != 0) state |= 1 << START;  // Pause
 +        if ((b0 & 0x20) != 0) state |= 1 << BACK;   // RTH
 +        if ((b1 & 0x80) != 0) state |= 1 << UP;     // 5D
@@ -390,7 +428,6 @@ index 0000000..9465e4d
 +
 +        if ((wheel & 0x80) != 0) {
 +            mWheelDir = (wheel & 0x40) != 0 ? RIGHT : LEFT;
-+            long now = System.currentTimeMillis();
 +            if (now >= mWheelNextTap) {
 +                mWheelTapUntil = now + WHEEL_TAP_MS;
 +                mWheelNextTap = now + WHEEL_REPEAT_MS;
@@ -425,7 +462,78 @@ index 0000000..9465e4d
 +        }
 +    }
 +
++    /**
++     * True if axis i follows the USB gamepad. Compares it with the DUML value
++     * on every DUML report; a sustained disagreement (the gamepad stopped
++     * reporting, or reports something else) hands the axis back to DUML.
++     */
++    private boolean fastActive(int i, float duml, long now) {
++        if (!mFastSeen[i] || now < mFastBackoffUntil[i]) return false;
++        if (Math.abs(mFast[i] - duml) <= FAST_MISMATCH) {
++            mFastMismatch[i] = 0;
++            return true;
++        }
++        if (++mFastMismatch[i] < FAST_MISMATCH_REPORTS) return true;
++        mFastMismatch[i] = 0;
++        mFastSeen[i] = false;
++        mFastBackoffUntil[i] = now + FAST_BACKOFF_MS;
++        mFastFallbacks++;
++        Log.w(TAG, "fast axis " + i + " disagrees with DUML (" + mFast[i] + " vs " + duml
++                + "); using DUML");
++        return false;
++    }
++
++    private static boolean isEmbeddedGamepad(InputDevice device) {
++        return device != null && device.getVendorId() == VENDOR_ID
++                && device.getProductId() == EMBEDDED_PRODUCT_ID;
++    }
++
++    /**
++     * Called by the activity for every generic motion event (the RC gamepad's
++     * events do not reach SDL's view listener). Returns true if consumed.
++     */
++    public static boolean onGenericMotion(MotionEvent event) {
++        DjiRcJoystickHandler h = sInstance;
++        if (h == null || !isEmbeddedGamepad(event.getDevice())) return false;
++        if (event.getActionMasked() == MotionEvent.ACTION_MOVE) h.onFastMotion(event);
++        return true;
++    }
++
++    @Override
++    boolean handleMotionEvent(MotionEvent event) {
++        if (isEmbeddedGamepad(event.getDevice())) {
++            if (event.getActionMasked() == MotionEvent.ACTION_MOVE) onFastMotion(event);
++            return true;
++        }
++        return super.handleMotionEvent(event);
++    }
++
++    /** Sticks and back wheels from the USB gamepad (Android scales them to -1..1). */
++    private void onFastMotion(MotionEvent event) {
++        synchronized (mLock) {
++            if (mInjecting) return;
++            mFastEvents++;
++            long now = System.currentTimeMillis();
++            for (int i = 0; i < 6; i++) {
++                float v = event.getAxisValue(FAST_SOURCE[i]);
++                if (i >= 4) v = Math.abs(v) * 2f - 1f;  // wheel, centred -> trigger
++                v = v > 1f ? 1f : (v < -1f ? -1f : v);
++                if (v == mFast[i] && mFastSeen[i]) continue;
++                mFast[i] = v;
++                if (now < mFastBackoffUntil[i]) continue;
++                mFastSeen[i] = true;
++                setAxis(i, v);
++            }
++        }
++    }
++
++    private boolean mShutterHalf, mShutterFull;
++    // Axis values before the shutter is applied to the triggers.
++    private final float[] mRawAxes = { 0f, 0f, 0f, 0f, -1f, -1f };
++
 +    private void setAxis(int index, float value) {
++        mRawAxes[index] = value;
++        if ((index == 4 && mShutterHalf) || (index == 5 && mShutterFull)) value = 1f;
 +        if (Math.abs(value - mAxes[index]) < 0.004f) return;
 +        mAxes[index] = value;
 +        SDLControllerManager.onNativeJoy(DEVICE_ID, index, value);
@@ -434,6 +542,7 @@ index 0000000..9465e4d
 +    private void releaseAll() {
 +        synchronized (mLock) {
 +            mWheelTapUntil = 0;
++            mShutterHalf = mShutterFull = false;
 +            applyButtons(0, true);
 +            for (int i = 0; i < 6; i++) setAxis(i, i < 4 ? 0f : -1f);
 +        }
