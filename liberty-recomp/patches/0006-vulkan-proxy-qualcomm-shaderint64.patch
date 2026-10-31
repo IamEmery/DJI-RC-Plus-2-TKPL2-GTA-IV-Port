@@ -1,0 +1,64 @@
+diff --git a/os/android/native/driver_proxy.cpp b/os/android/native/driver_proxy.cpp
+index 638f623..47fe99c 100644
+--- a/os/android/native/driver_proxy.cpp
++++ b/os/android/native/driver_proxy.cpp
+@@ -443,6 +443,51 @@ EXPORT jstring JNICALL Java_com_libertyrecomp_DriverBridge_nativeStatus(JNIEnv*
+   return env->NewStringUTF(g_status.c_str());
+ }
+ 
++namespace {
++// TKPL2: the Qualcomm v805 driver (AdrenoTools package, patched to API level
++// 1.3) can run 64-bit integer shaders on the Adreno 643 but does not advertise
++// shaderInt64 there, which the native shaders require. Set the bit in the
++// driver's own feature table, which both the feature queries and
++// vkCreateDevice's validation read. Only for that exact driver build, and only
++// when the table at the known offset is byte-identical to what the driver
++// reports, so any other driver or layout is left untouched.
++constexpr uint32_t kQcomV805DriverVersion = 0x80325000;
++constexpr size_t kQcomFeatureTableContext = 0x1550;
++constexpr size_t kQcomFeatureTableOffset = 0x88;
++
++void EnableQualcommShaderInt64(VkInstance instance) {
++  const auto enumerate = Get<PFN_vkEnumeratePhysicalDevices>(instance, "vkEnumeratePhysicalDevices");
++  const auto properties = Get<PFN_vkGetPhysicalDeviceProperties>(instance, "vkGetPhysicalDeviceProperties");
++  const auto features = Get<PFN_vkGetPhysicalDeviceFeatures>(instance, "vkGetPhysicalDeviceFeatures");
++  if (!enumerate || !properties || !features) return;
++  uint32_t count = kMaxPhysicalDevices;
++  VkPhysicalDevice devices[kMaxPhysicalDevices];
++  if (enumerate(instance, &count, devices) < 0) return;
++  for (uint32_t i = 0; i < count; ++i) {
++    VkPhysicalDeviceProperties basic{};
++    properties(devices[i], &basic);
++    if (basic.vendorID != 0x5143 || basic.driverVersion != kQcomV805DriverVersion) continue;
++    VkPhysicalDeviceFeatures reported{};
++    features(devices[i], &reported);
++    if (reported.shaderInt64) continue;
++    auto* driver_data = *reinterpret_cast<char**>(reinterpret_cast<char*>(devices[i]) + sizeof(void*));
++    if (!driver_data) continue;
++    auto* context = *reinterpret_cast<char**>(driver_data + kQcomFeatureTableContext);
++    if (!context) continue;
++    auto* table = reinterpret_cast<VkPhysicalDeviceFeatures*>(context + kQcomFeatureTableOffset);
++    if (std::memcmp(table, &reported, sizeof(reported)) != 0) {
++      __android_log_print(ANDROID_LOG_WARN, kTag, "Qualcomm feature table not found, shaderInt64 left off");
++      continue;
++    }
++    table->shaderInt64 = VK_TRUE;
++    VkPhysicalDeviceFeatures now{};
++    features(devices[i], &now);
++    __android_log_print(ANDROID_LOG_INFO, kTag, "Qualcomm v805 on %s: shaderInt64 enabled (%u)",
++                        basic.deviceName, now.shaderInt64);
++  }
++}
++}  // namespace
++
+ EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(
+     const VkInstanceCreateInfo* info, const VkAllocationCallbacks* allocator, VkInstance* instance) {
+   if (!g_ready.load(std::memory_order_acquire)) return VK_ERROR_INITIALIZATION_FAILED;
+@@ -451,6 +496,7 @@ EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(
+   if (result != VK_SUCCESS) return result;
+   const uint32_t api = info && info->pApplicationInfo && info->pApplicationInfo->apiVersion ?
+       info->pApplicationInfo->apiVersion : VK_API_VERSION_1_0;
++  if (g_custom) EnableQualcommShaderInt64(*instance);
+   std::string devices, error;
+   if (!VerifyInstance(*instance, api, devices, error)) {
+     __android_log_print(ANDROID_LOG_ERROR, kTag, "Game Vulkan instance rejected: %s", error.c_str());

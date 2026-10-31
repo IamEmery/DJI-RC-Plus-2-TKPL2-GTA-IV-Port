@@ -1,0 +1,484 @@
+diff --git a/os/android/app/src/main/java/com/libertyrecomp/LibertyActivity.java b/os/android/app/src/main/java/com/libertyrecomp/LibertyActivity.java
+index a05ae52..646b7fe 100644
+--- a/os/android/app/src/main/java/com/libertyrecomp/LibertyActivity.java
++++ b/os/android/app/src/main/java/com/libertyrecomp/LibertyActivity.java
+@@ -9,9 +9,11 @@ import android.os.Bundle;
+ import android.system.ErrnoException;
+ import android.system.Os;
+ import android.util.Log;
++import android.view.KeyEvent;
+ import android.view.View;
+ import android.view.WindowManager;
+ 
++import org.libsdl.app.DjiRcJoystickHandler;
+ import org.libsdl.app.SDLActivity;
+ import org.libsdl.app.SDLSurface;
+ 
+@@ -86,10 +88,26 @@ public class LibertyActivity extends SDLActivity {
+     private boolean mDebugLog;
+     private File mDebugLogFile;
+ 
++    /** The DJI RC Plus 2 top buttons (L1-L3, R1-R3) arrive as F1-F6 from gpio-keys. */
++    @Override
++    public boolean dispatchKeyEvent(KeyEvent event) {
++        int code = event.getKeyCode();
++        if (code >= KeyEvent.KEYCODE_F1 && code <= KeyEvent.KEYCODE_F6
++                && event.getAction() != KeyEvent.ACTION_MULTIPLE) {
++            if (event.getRepeatCount() > 0) return true;
++            if (DjiRcJoystickHandler.onTopKey(code, event.getAction() == KeyEvent.ACTION_DOWN)) {
++                return true;
++            }
++        }
++        return super.dispatchKeyEvent(event);
++    }
++
+     @Override
+     protected void onCreate(Bundle savedInstanceState) {
+         prepareEnvironment();
+         super.onCreate(savedInstanceState);
++        // DJI RC Plus 2: its sticks and buttons become an SDL gamepad.
++        DjiRcJoystickHandler.install();
+         // A controller-driven game sends no touch events for minutes at a time.
+         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+         // Steady clocks the device can hold, instead of peaks followed by
+diff --git a/os/android/app/src/main/java/org/libsdl/app/DjiRcJoystickHandler.java b/os/android/app/src/main/java/org/libsdl/app/DjiRcJoystickHandler.java
+new file mode 100644
+index 0000000..9465e4d
+--- /dev/null
++++ b/os/android/app/src/main/java/org/libsdl/app/DjiRcJoystickHandler.java
+@@ -0,0 +1,435 @@
++package org.libsdl.app;
++
++import android.util.Log;
++import android.view.KeyEvent;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.InetSocketAddress;
++import java.net.Socket;
++import java.net.SocketTimeoutException;
++
++/**
++ * Exposes the built-in controls of a DJI RC Plus 2 as an SDL gamepad.
++ *
++ * The sticks, wheels and most buttons never reach Android's input system on
++ * this controller (its "DJI Virtual Joystick" HID stays silent). The DJI
++ * system service publishes them instead as DUML packets (cmd_set 0x06,
++ * cmd_id 0xAE) on 127.0.0.1:40007 for as long as a client keeps sending a
++ * keepalive. The six top buttons (L1-L3, R1-R3) arrive separately as F1-F6
++ * key events from gpio-keys and are forwarded by LibertyActivity.
++ *
++ * Layout (Xbox 360): sticks -> sticks, left/right back wheel -> LT/RT,
++ * C2/C1/C3/R1 -> A/X/B/Y, L1 -> LB, shutter (full) -> RB, 5D -> D-pad and
++ * its press -> L3, L2 -> R3, top-right wheel -> D-pad left/right,
++ * Pause -> Start, RTH -> Back.
++ */
++public class DjiRcJoystickHandler extends SDLJoystickHandler {
++    private static final String TAG = "DjiRc";
++
++    static final int DEVICE_ID = 0x2CA30001;
++    private static final int VENDOR_ID = 0x2CA3;
++    private static final int PRODUCT_ID = 0x1502;
++
++    private static final String HOST = "127.0.0.1";
++    private static final int PORT = 40007;
++    private static final byte[] MAGIC = { 0x55, (byte) 0xCC, 0x30, 0x75 };
++    private static final long KEEPALIVE_MS = 40;
++    private static final float AXIS_RANGE = 660f;
++
++    // SDL button bits for nativeAddJoystick (see SDLJoystickHandler.getButtonMask):
++    // A, B, X, Y, Back, Start, LeftStick, RightStick, LB, RB, D-pad.
++    private static final int BUTTON_MASK = 0x7FDF;
++    // Left stick, right stick and both triggers.
++    private static final int AXIS_MASK = 0x003F;
++
++    // Virtual buttons, indexed into KEYCODES.
++    private static final int A = 0, B = 1, X = 2, Y = 3, LB = 4, RB = 5, BACK = 6, START = 7,
++            L3 = 8, R3 = 9, UP = 10, DOWN = 11, LEFT = 12, RIGHT = 13;
++    private static final int[] KEYCODES = {
++        KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_BUTTON_B, KeyEvent.KEYCODE_BUTTON_X,
++        KeyEvent.KEYCODE_BUTTON_Y, KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_R1,
++        KeyEvent.KEYCODE_BUTTON_SELECT, KeyEvent.KEYCODE_BUTTON_START,
++        KeyEvent.KEYCODE_BUTTON_THUMBL, KeyEvent.KEYCODE_BUTTON_THUMBR,
++        KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
++        KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT,
++    };
++
++    // Top-right wheel: one D-pad tap per detent burst.
++    private static final long WHEEL_TAP_MS = 120;
++    private static final long WHEEL_REPEAT_MS = 260;
++
++    private static DjiRcJoystickHandler sInstance;
++
++    // Guards the input state. Never the handler's own monitor: SDL calls
++    // detectDevices() (synchronized on this) while holding its joystick lock,
++    // and this thread takes that lock inside onNativeJoy/onNativePad*.
++    private final Object mLock = new Object();
++    private final boolean[] mPressed = new boolean[KEYCODES.length];
++    private final float[] mAxes = { 0f, 0f, 0f, 0f, -1f, -1f };
++    // Buttons held through gpio-keys (L1, L2, R1); merged with the DUML state.
++    private volatile int mTopKeys;
++    private Thread mThread;
++    private volatile boolean mConnected;
++    private long mWheelTapUntil, mWheelNextTap;
++    private int mWheelDir;
++    // Diagnostics: frames seen since the last periodic log line.
++    private int mFrames, mOtherFrames;
++    private long mNextStatusLog;
++
++    /** Replaces SDL's joystick handler; call after SDLActivity.onCreate. */
++    public static void install() {
++        if (sInstance != null) return;
++        sInstance = new DjiRcJoystickHandler();
++        SDLControllerManager.mJoystickHandler = sInstance;
++        Log.i(TAG, "installed");
++    }
++
++    /** Forwards an F1-F6 key from the top button row. Returns true if consumed. */
++    public static boolean onTopKey(int keyCode, boolean down) {
++        DjiRcJoystickHandler h = sInstance;
++        if (h == null) return false;
++        int bit;
++        switch (keyCode) {
++            case KeyEvent.KEYCODE_F1: bit = 1 << LB; break;   // L1
++            case KeyEvent.KEYCODE_F2: bit = 1 << R3; break;   // L2
++            case KeyEvent.KEYCODE_F3: bit = 0; break;          // L3 (free)
++            case KeyEvent.KEYCODE_F4: bit = 1 << Y; break;    // R1
++            case KeyEvent.KEYCODE_F5: bit = 0; break;          // R2 (free)
++            case KeyEvent.KEYCODE_F6: bit = 0; break;          // R3 (free)
++            default: return false;
++        }
++        synchronized (h.mLock) {
++            h.mTopKeys = down ? (h.mTopKeys | bit) : (h.mTopKeys & ~bit);
++            if (!h.mConnected) h.applyButtons(0, false);
++        }
++        return true;
++    }
++
++    @Override
++    synchronized void detectDevices() {
++        // Register first so the bridge gets the first SDL instance and player
++        // slot 0, which is the only slot the game reads. SDL drops its native
++        // joystick list on quit and asks again here; nativeAddJoystick ignores
++        // ids it already knows.
++        Log.i(TAG, "detectDevices: registering virtual gamepad");
++        SDLControllerManager.nativeAddJoystick(DEVICE_ID, "DJI RC Plus 2", "dji-rc-plus2-duml",
++                VENDOR_ID, PRODUCT_ID, BUTTON_MASK, 6, AXIS_MASK, 0,
++                false, false, false, false);
++        super.detectDevices();
++        if (mThread == null) {
++            mThread = new Thread(this::run, "DjiRcBridge");
++            mThread.setDaemon(true);
++            mThread.start();
++            Thread inject = new Thread(this::runInject, "DjiRcInject");
++            inject.setDaemon(true);
++            inject.start();
++        }
++    }
++
++    // ── Test input (adb) ─────────────────────────────────────────────────
++
++    // While this file exists it replaces the RC: one line
++    // "lx ly rx ry lt rt buttons" (sticks -1..1 with SDL's downward Y,
++    // triggers 0..1, buttons as hex bits of A..RIGHT above). Written over adb
++    // for unattended benchmarks; deleting it hands control back to the RC.
++    private static final String INJECT_PATH =
++            "/sdcard/Android/data/com.libertyrecomp/files/inject.txt";
++    private volatile boolean mInjecting;
++
++    private void runInject() {
++        java.io.File file = new java.io.File(INJECT_PATH);
++        long lastModified = -1;
++        while (true) {
++            try {
++                Thread.sleep(50);
++            } catch (InterruptedException e) {
++                return;
++            }
++            if (!file.exists()) {
++                if (mInjecting) {
++                    mInjecting = false;
++                    lastModified = -1;
++                    releaseAll();
++                    Log.i(TAG, "inject: off");
++                }
++                continue;
++            }
++            long modified = file.lastModified();
++            if (modified == lastModified) continue;
++            lastModified = modified;
++            String line;
++            try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(file))) {
++                line = reader.readLine();
++            } catch (IOException e) {
++                continue;
++            }
++            if (line == null) continue;
++            String[] f = line.trim().split("\\s+");
++            if (f.length < 7) continue;
++            try {
++                float[] v = new float[6];
++                for (int i = 0; i < 6; i++) v[i] = Float.parseFloat(f[i]);
++                int buttons = Integer.parseInt(f[6], 16);
++                synchronized (mLock) {
++                    if (!mInjecting) Log.i(TAG, "inject: on");
++                    mInjecting = true;
++                    for (int i = 0; i < 4; i++) setAxis(i, Math.max(-1f, Math.min(1f, v[i])));
++                    setAxis(4, Math.max(0f, Math.min(1f, v[4])) * 2f - 1f);
++                    setAxis(5, Math.max(0f, Math.min(1f, v[5])) * 2f - 1f);
++                    mWheelTapUntil = 0;
++                    mDumlButtons = buttons;
++                    int saved = mTopKeys;
++                    mTopKeys = 0;
++                    applyButtons(buttons, false);
++                    mTopKeys = saved;
++                }
++            } catch (NumberFormatException e) {
++                Log.w(TAG, "inject: bad line " + line);
++            }
++        }
++    }
++
++    /**
++     * Hides the controller's own "DJI Virtual Joystick" (2ca3:1501). It never
++     * reports anything, but as a real gamepad it would take player slot 0.
++     */
++    @Override
++    void deviceAdded(int device_id) {
++        android.view.InputDevice device = android.view.InputDevice.getDevice(device_id);
++        if (device != null && device.getVendorId() == VENDOR_ID && device.getProductId() == 0x1501) {
++            Log.i(TAG, "ignoring silent " + device.getName());
++            return;
++        }
++        super.deviceAdded(device_id);
++    }
++
++    // ── DUML transport ───────────────────────────────────────────────────
++
++    private void run() {
++        while (true) {
++            try (Socket s = new Socket()) {
++                s.setTcpNoDelay(true);
++                s.connect(new InetSocketAddress(HOST, PORT), 1000);
++                s.setSoTimeout(20);
++                Log.i(TAG, "connected to " + HOST + ":" + PORT);
++                mConnected = true;
++                pump(s.getInputStream(), s.getOutputStream());
++            } catch (IOException e) {
++                Log.w(TAG, "connection: " + e.getMessage());
++            } finally {
++                if (mConnected) {
++                    mConnected = false;
++                    releaseAll();
++                }
++            }
++            try {
++                Thread.sleep(1000);
++            } catch (InterruptedException e) {
++                return;
++            }
++        }
++    }
++
++    private void pump(InputStream in, OutputStream out) throws IOException {
++        byte[] buf = new byte[65536];
++        int len = 0, seq = 0;
++        long nextKeepalive = 0;
++        while (true) {
++            long now = System.currentTimeMillis();
++            if (now >= nextKeepalive) {
++                out.write(keepalive(seq));
++                seq = (seq + 1) & 0xFFFF;
++                nextKeepalive = now + KEEPALIVE_MS;
++            }
++            updateWheelTap(now);
++            if (now >= mNextStatusLog) {
++                mNextStatusLog = now + 5000;
++                Log.i(TAG, "status: rc frames=" + mFrames + " other=" + mOtherFrames
++                        + " axes=" + java.util.Arrays.toString(mAxes) + " buttons=0x"
++                        + Integer.toHexString(mDumlButtons | mTopKeys));
++                mFrames = mOtherFrames = 0;
++            }
++            int n;
++            try {
++                n = in.read(buf, len, buf.length - len);
++            } catch (SocketTimeoutException e) {
++                continue;
++            }
++            if (n < 0) throw new IOException("closed by RC");
++            len += n;
++            len = consumeFrames(buf, len);
++        }
++    }
++
++    /** Parses complete transport frames, keeps a trailing partial frame. */
++    private int consumeFrames(byte[] buf, int len) {
++        int off = 0;
++        while (len - off >= 8) {
++            if (buf[off] != MAGIC[0] || buf[off + 1] != MAGIC[1]
++                    || buf[off + 2] != MAGIC[2] || buf[off + 3] != MAGIC[3]) {
++                off++;
++                continue;
++            }
++            int plen = (buf[off + 4] & 0xFF) | (buf[off + 5] & 0xFF) << 8
++                    | (buf[off + 6] & 0xFF) << 16 | (buf[off + 7] & 0xFF) << 24;
++            if (plen < 0 || plen > buf.length - 8) {
++                off++;
++                continue;
++            }
++            if (len - off - 8 < plen) break;
++            int p = off + 8;
++            if (plen >= 13 + 17 && buf[p] == 0x55
++                    && (buf[p + 9] & 0xFF) == 0x06 && (buf[p + 10] & 0xFF) == 0xAE) {
++                mFrames++;
++                onRcState(buf, p + 11);
++            } else {
++                mOtherFrames++;
++            }
++            off += 8 + plen;
++        }
++        if (off > 0) {
++            System.arraycopy(buf, off, buf, 0, len - off);
++            len -= off;
++        }
++        if (len == buf.length) len = 0;  // garbage without a frame; resync
++        return len;
++    }
++
++    // ── RC state -> SDL ──────────────────────────────────────────────────
++
++    private static float axis(byte[] b, int at) {
++        int v = ((b[at] & 0xFF) | (b[at + 1] & 0xFF) << 8) - 1024;
++        float f = v / AXIS_RANGE;
++        return f > 1f ? 1f : (f < -1f ? -1f : f);
++    }
++
++    private void onRcState(byte[] b, int p) {
++        synchronized (mLock) {
++            onRcStateLocked(b, p);
++        }
++    }
++
++    private void onRcStateLocked(byte[] b, int p) {
++        if (mInjecting) return;
++        // Payload offsets: buttons 0-2, top-right wheel 4, axes 5..16.
++        float rh = axis(b, p + 5), rv = axis(b, p + 7);
++        float lv = axis(b, p + 9), lh = axis(b, p + 11);
++        float lw = axis(b, p + 13), rw = axis(b, p + 15);
++        // SDL: Y grows downwards; triggers run from -1 (released) to 1.
++        setAxis(0, lh);
++        setAxis(1, -lv);
++        setAxis(2, rh);
++        setAxis(3, -rv);
++        setAxis(4, Math.abs(lw) * 2f - 1f);
++        setAxis(5, Math.abs(rw) * 2f - 1f);
++
++        int b0 = b[p] & 0xFF, b1 = b[p + 1] & 0xFF, b2 = b[p + 2] & 0xFF, wheel = b[p + 4] & 0xFF;
++        int state = 0;
++        if ((b2 & 0x08) != 0) state |= 1 << A;      // C2
++        if ((b2 & 0x04) != 0) state |= 1 << X;      // C1
++        if ((b2 & 0x10) != 0) state |= 1 << B;      // C3
++        if ((b0 & 0x40) != 0) state |= 1 << RB;     // shutter, full press
++        if ((b0 & 0x10) != 0) state |= 1 << START;  // Pause
++        if ((b0 & 0x20) != 0) state |= 1 << BACK;   // RTH
++        if ((b1 & 0x80) != 0) state |= 1 << UP;     // 5D
++        if ((b1 & 0x40) != 0) state |= 1 << DOWN;
++        if ((b1 & 0x20) != 0) state |= 1 << LEFT;
++        if ((b1 & 0x10) != 0) state |= 1 << RIGHT;
++        if ((b1 & 0x08) != 0) state |= 1 << L3;     // 5D press
++
++        if ((wheel & 0x80) != 0) {
++            mWheelDir = (wheel & 0x40) != 0 ? RIGHT : LEFT;
++            long now = System.currentTimeMillis();
++            if (now >= mWheelNextTap) {
++                mWheelTapUntil = now + WHEEL_TAP_MS;
++                mWheelNextTap = now + WHEEL_REPEAT_MS;
++            }
++        }
++        applyButtons(state, true);
++    }
++
++    private int mDumlButtons;
++
++    /** Merges DUML buttons, top keys and the wheel tap, and sends the changes. */
++    private void applyButtons(int dumlState, boolean fromDuml) {
++        if (fromDuml) mDumlButtons = dumlState;
++        int state = mDumlButtons | mTopKeys;
++        if (System.currentTimeMillis() < mWheelTapUntil) state |= 1 << mWheelDir;
++        for (int i = 0; i < KEYCODES.length; i++) {
++            boolean down = (state & (1 << i)) != 0;
++            if (down != mPressed[i]) {
++                mPressed[i] = down;
++                if (down) SDLControllerManager.onNativePadDown(DEVICE_ID, KEYCODES[i], 0);
++                else SDLControllerManager.onNativePadUp(DEVICE_ID, KEYCODES[i], 0);
++            }
++        }
++    }
++
++    private void updateWheelTap(long now) {
++        synchronized (mLock) {
++            if (mWheelTapUntil != 0 && now >= mWheelTapUntil) {
++                mWheelTapUntil = 0;
++                applyButtons(mDumlButtons, false);
++            }
++        }
++    }
++
++    private void setAxis(int index, float value) {
++        if (Math.abs(value - mAxes[index]) < 0.004f) return;
++        mAxes[index] = value;
++        SDLControllerManager.onNativeJoy(DEVICE_ID, index, value);
++    }
++
++    private void releaseAll() {
++        synchronized (mLock) {
++            mWheelTapUntil = 0;
++            applyButtons(0, true);
++            for (int i = 0; i < 6; i++) setAxis(i, i < 4 ? 0f : -1f);
++        }
++    }
++
++    // ── DUML keepalive: General / Version Query, App -> RC ───────────────
++
++    private static byte[] keepalive(int seq) {
++        byte[] pkt = new byte[13];
++        pkt[0] = 0x55;
++        pkt[1] = 13;
++        pkt[2] = 1 << 2;  // length high bits 0, protocol version 1
++        pkt[3] = (byte) crc8(pkt, 3);
++        pkt[4] = 2;       // sender: App
++        pkt[5] = 6;       // receiver: RC
++        pkt[6] = (byte) seq;
++        pkt[7] = (byte) (seq >> 8);
++        pkt[8] = 0;
++        pkt[9] = 0x00;    // cmd_set: General
++        pkt[10] = 0x01;   // cmd_id: Version Query
++        int crc = crc16(pkt, 11);
++        pkt[11] = (byte) crc;
++        pkt[12] = (byte) (crc >> 8);
++        byte[] frame = new byte[8 + 13];
++        System.arraycopy(MAGIC, 0, frame, 0, 4);
++        frame[4] = 13;
++        System.arraycopy(pkt, 0, frame, 8, 13);
++        return frame;
++    }
++
++    private static int crc8(byte[] d, int n) {
++        int crc = 0x77;
++        for (int i = 0; i < n; i++) {
++            crc ^= d[i] & 0xFF;
++            for (int k = 0; k < 8; k++) crc = (crc & 1) != 0 ? (crc >>> 1) ^ 0x8C : crc >>> 1;
++        }
++        return crc;
++    }
++
++    private static int crc16(byte[] d, int n) {
++        int crc = 0x3692;
++        for (int i = 0; i < n; i++) {
++            crc ^= d[i] & 0xFF;
++            for (int k = 0; k < 8; k++) crc = (crc & 1) != 0 ? (crc >>> 1) ^ 0x8408 : crc >>> 1;
++        }
++        return crc;
++    }
++}

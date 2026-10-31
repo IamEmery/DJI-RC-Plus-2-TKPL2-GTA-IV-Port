@@ -1,0 +1,96 @@
+diff --git a/glue/rexglue-sdk-main/gta4-recomp/generated/gta4_recomp.77.cpp b/glue/rexglue-sdk-main/gta4-recomp/generated/gta4_recomp.77.cpp
+index b8ac050..7ec229d 100644
+--- a/glue/rexglue-sdk-main/gta4-recomp/generated/gta4_recomp.77.cpp
++++ b/glue/rexglue-sdk-main/gta4-recomp/generated/gta4_recomp.77.cpp
+@@ -1,4 +1,5 @@
+ #include "gta4_init.h"
++extern "C" bool GTA4_StaleObjectReadable(uint32_t address, uint32_t bytes, const char* site);
+ 
+ DEFINE_REX_FUNC(sub_82967240) {
+ 	REX_FUNC_PROLOGUE();
+@@ -51563,6 +51564,11 @@ loc_8297B084:
+ 	// mr r30,r11
+ 	r30.u64 = ctx.r11.u64;
+ loc_8297B088:
++#if defined(__ANDROID__)
++	// Hand edit (TKPL2): a freed child from the table at object+48+648 takes
++	// the title's "no object at +60" path instead of faulting on the load.
++	if (!GTA4_StaleObjectReadable(r30.u32 + 60, 4, "sub_8297AF90")) goto loc_8297B0D4;
++#endif
+ 	// lwz r31,60(r30)
+ 	r31.u64 = REX_LOAD_U32(r30.u32 + 60);
+ 	// cmplwi cr6,r31,0
+diff --git a/glue/rexglue-sdk-main/gta4-recomp/generated/gta4_recomp.78.cpp b/glue/rexglue-sdk-main/gta4-recomp/generated/gta4_recomp.78.cpp
+index b97c7bf..7cf5d60 100644
+--- a/glue/rexglue-sdk-main/gta4-recomp/generated/gta4_recomp.78.cpp
++++ b/glue/rexglue-sdk-main/gta4-recomp/generated/gta4_recomp.78.cpp
+@@ -3757,6 +3757,11 @@ loc_8297D224:
+ 	ctx.r10.u64 = __builtin_rotateleft64(ctx.r10.u32 | (ctx.r10.u64 << 32), 2) & 0xFFFFFFFC;
+ 	// lwzx r27,r10,r11
+ 	r27.u64 = REX_LOAD_U32(ctx.r10.u32 + ctx.r11.u32);
++#if defined(__ANDROID__)
++	// Hand edit (TKPL2, same as the r24 walk below): a freed child takes the
++	// title's empty-table path (r27 = r11) instead of faulting at +100.
++	if (!GTA4_StaleChildGuard(r27.u32)) r27.u64 = ctx.r11.u64;
++#endif
+ 	// b 0x8297d26c
+ 	goto loc_8297D26C;
+ loc_8297D25C:
+diff --git a/glue/rexglue-sdk-main/gta4-recomp/src/android/android_stale_object_guard.cpp b/glue/rexglue-sdk-main/gta4-recomp/src/android/android_stale_object_guard.cpp
+index 767130c..faf6120 100644
+--- a/glue/rexglue-sdk-main/gta4-recomp/src/android/android_stale_object_guard.cpp
++++ b/glue/rexglue-sdk-main/gta4-recomp/src/android/android_stale_object_guard.cpp
+@@ -7,6 +7,8 @@
+ // pointer chain no longer leads to mapped memory, take the title's own
+ // no-object path rather than fault.
+ #include <android/log.h>
++#include <sys/uio.h>
++#include <unistd.h>
+ 
+ #include <atomic>
+ #include <cstdint>
+@@ -45,9 +47,19 @@ bool PageReadable(rex::memory::Memory* memory, uint32_t address) {
+   const uint32_t first = page << 12;
+   using rex::memory::PageAccess;
+   const auto access = heap->QueryRangeAccess(first, first + 0xFFF);
+-  const bool readable = access == PageAccess::kReadOnly || access == PageAccess::kReadWrite ||
+-                        access == PageAccess::kExecuteReadOnly ||
+-                        access == PageAccess::kExecuteReadWrite;
++  bool readable = access == PageAccess::kReadOnly || access == PageAccess::kReadWrite ||
++                  access == PageAccess::kExecuteReadOnly ||
++                  access == PageAccess::kExecuteReadWrite;
++  // The heap table can call a page readable whose host page is not (a stale
++  // child at a garbage address faulted right after this check, TKPL2
++  // 2026-10-31). Confirm with the kernel once per cached page: process_vm_readv
++  // reports EFAULT for an unreadable source instead of raising SIGSEGV.
++  if (readable) {
++    uint8_t probe;
++    iovec local{&probe, 1};
++    iovec remote{memory->TranslateVirtual<uint8_t*>(first), 1};
++    readable = process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == 1;
++  }
+   if (readable && epoch) {
+     t_readable_pages[t_readable_cursor++ % 16] = {heap, epoch, page};
+   }
+@@ -123,6 +135,21 @@ extern "C" bool GTA4_StaleChildGuard(uint32_t child) {
+   return false;
+ }
+ 
++// Generic form for further hand edits in the generated code: true when the
++// guest range is readable. sub_8297AF90 (called from the same entity walk)
++// reads child+60 of the table at object+48+648 and faulted there with a
++// stale child (TKPL2 2026-10-31 23:30).
++extern "C" bool GTA4_StaleObjectReadable(uint32_t address, uint32_t bytes, const char* site) {
++  if (!REXCVAR_GET(gta4_stale_object_guard) || Readable(address, bytes)) return true;
++  const uint64_t count = g_stale_objects.fetch_add(1, std::memory_order_relaxed) + 1;
++  if (count <= 8 || !(count % 1024)) {
++    __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp",
++                        "stale-object-guard: #%llu %s address=%08X",
++                        static_cast<unsigned long long>(count), site, address);
++  }
++  return false;
++}
++
+ extern "C" void sub_8296E480(PPCContext& ctx, uint8_t* base) {
+   if (GuardedMatrixCopy(ctx, base, 56, 112, "sub_8296E480")) __imp__sub_8296E480(ctx, base);
+ }

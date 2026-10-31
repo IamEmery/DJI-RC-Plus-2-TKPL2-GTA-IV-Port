@@ -1,0 +1,20 @@
+# Gradle / Android Studio
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+captures/
+
+# Never commit game data, keys or third-party binaries
+*.iso
+*.xex
+*.xexp
+*.apk
+*.so
+*.dex
+aes_key.bin
+*.profdata
+
+# macOS
+.DS_Store

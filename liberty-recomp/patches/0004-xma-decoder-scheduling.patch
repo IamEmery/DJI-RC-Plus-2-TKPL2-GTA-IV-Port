@@ -1,0 +1,76 @@
+diff --git a/glue/rexglue-sdk-main/src/audio/xma_decoder.cpp b/glue/rexglue-sdk-main/src/audio/xma_decoder.cpp
+index 1cf45ea..a4da1f9 100644
+--- a/glue/rexglue-sdk-main/src/audio/xma_decoder.cpp
++++ b/glue/rexglue-sdk-main/src/audio/xma_decoder.cpp
+@@ -10,7 +10,10 @@
+  */
+ 
+ #if defined(__ANDROID__)
++#include <sched.h>
+ #include <sys/resource.h>
++#include <cstdio>
++#include <vector>
+ #include <android/log.h>
+ #include <cerrno>
+ #include <unistd.h>
+@@ -157,6 +160,40 @@ void XmaDecoder::WorkerThreadMain() {
+     __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp", "audio-priority %s tid=%d result=%d errno=%d",
+                         "xma_decoder.cpp", int(gettid()), result, result ? errno : 0);
+   }
++  // The title's audio engine blocks in every context kick until this thread
++  // has decoded it (WriteRegister). On a little core the decode of a busy
++  // street mix took long enough that a quarter of the output blocks were
++  // silence (TKPL2, QCS5430); keep the decoder on the cores faster than the
++  // slowest cluster.
++  {
++    long slowest = 0;
++    std::vector<std::pair<int, long>> cores;
++    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
++      char path[96];
++      std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
++      FILE* file = std::fopen(path, "r");
++      if (!file) break;
++      long frequency = 0;
++      if (std::fscanf(file, "%ld", &frequency) != 1) frequency = 0;
++      std::fclose(file);
++      cores.emplace_back(cpu, frequency);
++      if (frequency && (!slowest || frequency < slowest)) slowest = frequency;
++    }
++    cpu_set_t set;
++    CPU_ZERO(&set);
++    int count = 0;
++    for (const auto& [cpu, frequency] : cores) {
++      if (frequency > slowest) {
++        CPU_SET(cpu, &set);
++        ++count;
++      }
++    }
++    if (count) {
++      const int result = sched_setaffinity(gettid(), sizeof(set), &set);
++      __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp", "audio-affinity xma_decoder cores=%d result=%d",
++                          count, result);
++    }
++  }
+ #endif
+   while (worker_running_) {
+     // Process only contexts made ready by a kick instead of scanning all 320
+@@ -321,6 +358,19 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+   register_file_[r] = value;
+ 
+   if (r >= XmaRegister::Context0Kick && r <= XmaRegister::Context9Kick) {
++#if defined(__ANDROID__)
++    // The guest thread that kicks XMA contexts is the title's audio engine;
++    // it produces every output frame. At the render threads' priority it lost
++    // the big cores on heavy street scenes and a third of the output blocks
++    // were silence (TKPL2, Adreno 643). Give it the audio priority once.
++    static thread_local bool audio_engine_priority = false;
++    if (!audio_engine_priority) {
++      audio_engine_priority = true;
++      const int result = setpriority(PRIO_PROCESS, gettid(), -16);
++      __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp", "audio-priority %s tid=%d result=%d errno=%d",
++                          "guest-audio-engine", int(gettid()), result, result ? errno : 0);
++    }
++#endif
+     handoff::Span handoff_kick("xma-kick", r, value);
+     // Context kick command.
+     // This will kick off the given hardware contexts.

@@ -1,0 +1,539 @@
+diff --git a/glue/rexglue-sdk-main/src/graphics/gta4_native/dirty_state_delta.h b/glue/rexglue-sdk-main/src/graphics/gta4_native/dirty_state_delta.h
+index 64bedd7..5346bb5 100644
+--- a/glue/rexglue-sdk-main/src/graphics/gta4_native/dirty_state_delta.h
++++ b/glue/rexglue-sdk-main/src/graphics/gta4_native/dirty_state_delta.h
+@@ -275,6 +275,48 @@ void ForEachDirtyElement(const NativeDirtyWords& dirty_words, const DirtyCompone
+ 
+ inline void BuildRangeSet(const NativeDirtyWords& dirty_words, const DirtyComponentLayout& layout,
+                           DirtyRangeSet& result, DirtyDeltaScratch& scratch) {
++  // Small layouts (every constant/stage layout) mark a stack bitset and read
++  // runs straight off it: elements come out sorted and unique without the
++  // vector, sort and unique below, which ran for every captured draw.
++  constexpr uint32_t kBitsetWords = 8;
++  if (layout.element_count <= kBitsetWords * 64) {
++    uint64_t marked[kBitsetWords] = {};
++    ForEachDirtyElement(dirty_words, layout,
++                        [&](uint32_t element) { marked[element >> 6] |= uint64_t{1} << (element & 63); });
++    result.ranges.clear();
++    const uint32_t words = (layout.element_count + 63) / 64;
++    uint32_t run_first = 0, run_count = 0;
++    for (uint32_t word = 0; word < words; ++word) {
++      uint64_t bits = marked[word];
++      if (!bits) {
++        if (run_count) result.ranges.push_back({run_first, run_count});
++        run_count = 0;
++        continue;
++      }
++      uint32_t bit = 0;
++      while (bit < 64) {
++        const uint64_t rest = bits >> bit;
++        if (!rest) {
++          if (run_count) result.ranges.push_back({run_first, run_count});
++          run_count = 0;
++          break;
++        }
++        const uint32_t zeros = uint32_t(std::countr_zero(rest));
++        if (zeros && run_count) {
++          result.ranges.push_back({run_first, run_count});
++          run_count = 0;
++        }
++        bit += zeros;
++        const uint32_t ones = uint32_t(std::countr_one(bits >> bit));
++        const uint32_t take = std::min<uint32_t>(ones, 64 - bit);
++        if (!run_count) run_first = word * 64 + bit;
++        run_count += take;
++        bit += take;
++      }
++    }
++    if (run_count) result.ranges.push_back({run_first, run_count});
++    return;
++  }
+   std::vector<uint32_t>& dirty_elements = scratch.dirty_elements;
+   dirty_elements.clear();
+   ForEachDirtyElement(dirty_words, layout,
+diff --git a/glue/rexglue-sdk-main/src/graphics/gta4_native/graphics_system.cpp b/glue/rexglue-sdk-main/src/graphics/gta4_native/graphics_system.cpp
+index 581a9d2..b4ab94b 100644
+--- a/glue/rexglue-sdk-main/src/graphics/gta4_native/graphics_system.cpp
++++ b/glue/rexglue-sdk-main/src/graphics/gta4_native/graphics_system.cpp
+@@ -389,6 +389,8 @@ REXCVAR_DEFINE_STRING(gta4_native_skip_pixel_shaders, "2673E2AF", "GTA IV/Graphi
+                       "Comma-separated pixel shader hash prefixes whose draws are not recorded");
+ REXCVAR_DEFINE_UINT32(gta4_native_debug_skip_gpu_range, 0, "GTA IV/Diagnostics",
+                       "TEMP: skip draws of one GPU range (performance::GpuRange + 1; 0 = none)");
++REXCVAR_DEFINE_UINT32(gta4_native_debug_log_passes, 0, "GTA IV/Diagnostics",
++                      "TEMP: changing this value logs every render pass and transfer of the next 2 frames");
+ REXCVAR_DEFINE_BOOL(gta4_native_reuse_lighting_real, true, "GTA IV/Graphics/Native Renderer",
+                     "Run local light stencil setups inside the open lighting pass using the "
+                     "draw's own shaders");
+@@ -402,6 +404,8 @@ REXCVAR_DEFINE_BOOL(gta4_gpu_counters, false, "GTA IV/Diagnostics",
+                     "Sample Adreno hardware counters per frame through VK_KHR_performance_query (Android)");
+ REXCVAR_DEFINE_BOOL(gta4_native_pipelined_recording, true, "GTA IV/Graphics/Native Renderer",
+                     "Record and submit each frame on a second thread while the worker assembles the next");
++REXCVAR_DEFINE_UINT32(gta4_native_protection_lock_spin, 0, "GTA IV/Graphics/Native Renderer",
++                      "Spin attempts on the queued texture protection lock before sleeping (0 = sleep at once)");
+ REXCVAR_DEFINE_BOOL(gta4_native_async_command_retire, true, "GTA IV/Graphics/Native Renderer",
+                     "Destroy recorded frame commands on a background thread");
+ REXCVAR_DEFINE_BOOL(gta4_vertex_color_as_rgba, false, "GTA IV/Diagnostics",
+@@ -527,6 +531,9 @@ REXCVAR_DEFINE_UINT32(gta4_trace_water_reflection_frames, 8, "GTA IV/Diagnostics
+     .range(0, 120);
+ REXCVAR_DEFINE_BOOL(gta4_native_descriptor_paging, true, "GTA IV/Graphics/Native Renderer",
+                     "Use fence-owned indexed descriptor working sets rather than lifetime-sized tables");
++REXCVAR_DEFINE_BOOL(gta4_native_extend_rendering_scope, true, "GTA IV/Graphics/Native Renderer",
++                    "Keep the rendering scope open for draws whose attachments are a subset of the "
++                    "active ones (borrow them with the draw's own write mask)");
+ REXCVAR_DEFINE_BOOL(gta4_native_reuse_lighting_passes, true, "GTA IV/Graphics/Native Renderer",
+                     "Keep compatible stencil-only light setup draws inside the active lighting pass");
+ REXCVAR_DEFINE_BOOL(gta4_native_batch_texture_uploads, true, "GTA IV/Graphics/Native Renderer",
+@@ -673,6 +680,11 @@ std::atomic<uint64_t> g_worker_ring_checked{0}, g_worker_ring_mismatches{0};
+ std::array<std::atomic<uint32_t>, 40000> g_rendering_end_sites{};
+ std::array<std::atomic<uint32_t>, 40000> g_barrier_sites{};
+ std::array<std::atomic<uint32_t>, 4096> g_rendering_split_reasons{};
++std::atomic<uint32_t> g_rendering_scope_borrows{0};
++// TKPL2 capture-path counters (producer thread; read by the 120-frame report).
++std::atomic<uint64_t> g_cap_buf_calls{0}, g_cap_buf_same_frame{0}, g_cap_buf_validated{0},
++    g_cap_buf_dirty_equal{0}, g_cap_buf_dirty_equal_bytes{0}, g_cap_buf_recapture{0},
++    g_cap_buf_recapture_bytes{0}, g_cap_const_bytes{0}, g_cap_const_full{0}, g_cap_draws{0};
+ // TEMP: resolve-class GPU work per call site, and resolve reuse totals.
+ std::array<std::atomic<uint32_t>, 65536> g_resolve_sites{};
+ std::atomic<uint64_t> g_resolve_reuse_candidates{0}, g_resolve_reuse_hits{0};
+@@ -711,9 +723,9 @@ uint32_t MaxQueuedTitlePresents() {
+   return std::clamp<uint32_t>(REXCVAR_GET(gta4_native_max_queued_frames), 1, 4);
+ }
+ 
+-std::unique_lock<std::mutex> LockWithSpin(std::mutex& mutex) {
++std::unique_lock<std::mutex> LockWithSpin(std::mutex& mutex, int attempts = 512) {
+   std::unique_lock lock(mutex, std::defer_lock);
+-  for (int attempt = 0; attempt < 512; ++attempt) {
++  for (int attempt = 0; attempt < attempts; ++attempt) {
+     if (lock.try_lock()) return lock;
+ #if defined(__aarch64__)
+     asm volatile("yield");
+@@ -4946,6 +4958,11 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
+       if (!vertex_captured || !pixel_captured) {
+         return reject(header.type, "constant-delta-capture");
+       }
++      g_cap_draws.fetch_add(1, std::memory_order_relaxed);
++      g_cap_const_bytes.fetch_add(native_command.shader_constant_delta.vertex_constants.payload.size() +
++                                  native_command.shader_constant_delta.pixel_constants.payload.size(),
++                                  std::memory_order_relaxed);
++      if (full_semantic_capture) g_cap_const_full.fetch_add(1, std::memory_order_relaxed);
+       native_command.shader_constant_delta.booleans_present =
+           full_semantic_capture || dirty_delta.boolean_constant_mask.Any();
+       if (native_command.shader_constant_delta.booleans_present) {
+@@ -5193,7 +5210,7 @@ Gta4NativeGraphicsSystem::CreateResolvedTextureResource(const ResolveCommand& co
+     }
+   }
+ 
+-  auto resource = std::make_shared<NativeTextureResource>();
++  auto resource = std::shared_ptr<NativeTextureResource>(new NativeTextureResource());  // see NativeBufferResource
+   resource->handle = command.destination_texture;
+   resource->fetch = fetch;
+   resource->info = info;
+@@ -5272,6 +5289,7 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
+   // Slots are dropped when the handle is dirtied or released; a recorder-side
+   // clear or reclamation bumps the epoch. weak_ptr keeps use_count() exact for
+   // reclamation.
++  g_cap_buf_calls.fetch_add(1, std::memory_order_relaxed);
+   BufferCaptureCacheSlot& cache_slot = BufferCaptureSlot(handle);
+   const uint64_t cache_epoch = buffer_resources_epoch_.load(std::memory_order_acquire);
+   auto remember = [&](const std::shared_ptr<const NativeBufferResource>& resource) {
+@@ -5294,6 +5312,7 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
+       if (REXCVAR_GET(gta4_native_buffer_validation_per_frame) &&
+           cached->last_used_frame.load(std::memory_order_relaxed) ==
+               g_native_memory_profile_event_frame.load(std::memory_order_relaxed)) {
++        g_cap_buf_same_frame.fetch_add(1, std::memory_order_relaxed);
+         return cached;
+       }
+       const uint8_t* cached_data = memory_->TranslateVirtual<const uint8_t*>(data_address);
+@@ -5308,6 +5327,7 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
+           cached->shadow_validation_offset.store(validation_range.next_offset,
+                                                  std::memory_order_relaxed);
+           buffer_capture_reuse_count_.fetch_add(1, std::memory_order_relaxed);
++          g_cap_buf_validated.fetch_add(1, std::memory_order_relaxed);
+           cached->last_used_frame.store(
+               g_native_memory_profile_event_frame.load(std::memory_order_relaxed),
+               std::memory_order_relaxed);
+@@ -5348,6 +5368,8 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
+     std::lock_guard lock(buffer_resource_mutex_);
+     const auto existing = buffer_resources_.find(handle);
+     if (existing != buffer_resources_.end() && existing->second == matching_cache_entry) {
++      g_cap_buf_dirty_equal.fetch_add(1, std::memory_order_relaxed);
++      g_cap_buf_dirty_equal_bytes.fetch_add(data_size, std::memory_order_relaxed);
+       dirty_buffer_handles_.erase(handle);
+       matching_cache_entry->last_used_frame.store(
+           g_native_memory_profile_event_frame.load(std::memory_order_relaxed),
+@@ -5389,6 +5411,8 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
+     }
+   }
+ 
++  g_cap_buf_recapture.fetch_add(1, std::memory_order_relaxed);
++  g_cap_buf_recapture_bytes.fetch_add(data_size, std::memory_order_relaxed);
+   std::vector<uint8_t> payload(data, data + data_size);
+   const uint64_t content_hash = XXH3_64bits(payload.data(), payload.size());
+   std::lock_guard lock(buffer_resource_mutex_);
+@@ -5407,7 +5431,10 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
+     }
+   }
+ 
+-  auto resource = std::make_shared<NativeBufferResource>();
++  // Separate control block: every captured draw takes a reference while the
++  // recorder reads this object's fields; with make_shared both share a cache
++  // line and each reference costs a cross-core miss on the title thread.
++  auto resource = std::shared_ptr<NativeBufferResource>(new NativeBufferResource());
+   resource->handle = handle;
+   resource->flags = flags;
+   resource->guest_address = data_address;
+@@ -6144,7 +6171,7 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
+     }
+   }
+ 
+-  auto resource = std::make_shared<NativeTextureResource>();
++  auto resource = std::shared_ptr<NativeTextureResource>(new NativeTextureResource());  // see NativeBufferResource
+   resource->handle = handle;
+   resource->content_hash = content_hash;
+   resource->generation = next_texture_generation_++;
+@@ -6548,7 +6575,8 @@ void Gta4NativeGraphicsSystem::RenderWorkerMain() {
+       lock.unlock();
+       // The batch protects these commands now; drop their queue references
+       // without holding the queue lock (only this thread writes the batch).
+-      std::lock_guard queued_lock(queued_protection_mutex_);
++      auto queued_lock = LockWithSpin(queued_protection_mutex_,
++                                      int(REXCVAR_GET(gta4_native_protection_lock_spin)));
+       for (size_t i = 0; i < worker_command_batch_.size(); ++i)
+         QueueTextureProtectionLocked(worker_command_batch_[i], false);
+     }
+@@ -7126,7 +7154,16 @@ void Gta4NativeGraphicsSystem::RenderWorkerMain() {
+               std::string top;
+               for (size_t i = 0; i < reasons.size() && i < 10; ++i)
+                 top += fmt::format(" {:03X}={:.0f}", reasons[i].second, reasons[i].first / 120.0);
+-              __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp", "split-reasons/frame:%s", top.c_str());
++              __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp", "split-reasons/frame:%s borrows=%.1f", top.c_str(),
++                                  g_rendering_scope_borrows.exchange(0) / 120.0);
++              __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp",
++                  "capture/frame: draws=%.0f buf-calls=%.0f same-frame=%.0f validated=%.0f "
++                  "dirty-equal=%.0f (%.0f KB) recapture=%.0f (%.0f KB) const=%.0f KB full-const=%.0f",
++                  g_cap_draws.exchange(0) / 120.0, g_cap_buf_calls.exchange(0) / 120.0,
++                  g_cap_buf_same_frame.exchange(0) / 120.0, g_cap_buf_validated.exchange(0) / 120.0,
++                  g_cap_buf_dirty_equal.exchange(0) / 120.0, g_cap_buf_dirty_equal_bytes.exchange(0) / 120.0 / 1024,
++                  g_cap_buf_recapture.exchange(0) / 120.0, g_cap_buf_recapture_bytes.exchange(0) / 120.0 / 1024,
++                  g_cap_const_bytes.exchange(0) / 120.0 / 1024, g_cap_const_full.exchange(0) / 120.0);
+             }
+             {
+               std::string top;
+@@ -7645,8 +7682,9 @@ bool Gta4NativeGraphicsSystem::CoalesceStateCommand(const void* command, size_t
+     default:
+       break;
+   }
+-  const auto* bytes = static_cast<const uint8_t*>(command);
+-  producer_pending_state_.insert(producer_pending_state_.end(), bytes, bytes + command_size);
++  const size_t pending_end = producer_pending_state_.size();
++  producer_pending_state_.resize(pending_end + command_size);
++  std::memcpy(producer_pending_state_.data() + pending_end, command, command_size);
+   return true;
+ }
+ 
+@@ -11148,8 +11186,14 @@ void Gta4NativeGraphicsSystem::ExportNativeGpuProfile() {
+   metadata.settings.emplace_back("constant_upload_bytes", "actual register bytes written to mapped storage");
+   metadata.settings.emplace_back("constant_upload_register_bytes",
+                                  std::to_string(NativeConstantUploadTracker::kRegisterBytes));
+-  const std::filesystem::path output_path = rex::filesystem::GetUserFolder() / "LibertyRecomp" /
+-                                            "Diagnostics" / "native-performance-latest.log";
++  // REX_DIAGNOSTICS_DIR redirects the export, e.g. to app-internal storage that
++  // `adb shell run-as` can read (Android/data subfolders the app creates are not).
++  const char* diagnostics_override = std::getenv("REX_DIAGNOSTICS_DIR");
++  const std::filesystem::path output_path =
++      (diagnostics_override && *diagnostics_override
++           ? std::filesystem::path(diagnostics_override)
++           : rex::filesystem::GetUserFolder() / "LibertyRecomp" / "Diagnostics") /
++      "native-performance-latest.log";
+   const std::filesystem::path csv_path =
+       output_path.parent_path() / "native-performance-latest.csv";
+   native_gpu_profile_state_.export_thread = std::thread([this, output_path, csv_path]() {
+@@ -20259,8 +20303,13 @@ void Gta4NativeGraphicsSystem::CollectTextureProtection(const NativeCommand& com
+   command.protected_generations_collected = true;
+ }
+ 
++// The title thread takes this lock for every submitted command while the
++// worker holds it for tens of microseconds per batch release; parking in the
++// kernel on contention cost the title ~15 ms per frame in futex wakeups
++// (TKPL2, Adreno 643), so spin through a batch release first.
+ void Gta4NativeGraphicsSystem::QueueTextureProtection(const NativeCommand& command, bool retain) {
+-  std::lock_guard lock(queued_protection_mutex_);
++  auto lock = LockWithSpin(queued_protection_mutex_,
++                           int(REXCVAR_GET(gta4_native_protection_lock_spin)));
+   QueueTextureProtectionLocked(command, retain);
+ }
+ 
+@@ -31115,6 +31164,93 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
+         PhoneTraceConfig().readbacks));
+   }
+   const uint32_t debug_skip_gpu_range = REXCVAR_GET(gta4_native_debug_skip_gpu_range);
++  {
++    static uint32_t last_pass_log_trigger = 0;
++    const uint32_t trigger = REXCVAR_GET(gta4_native_debug_log_passes);
++    if (trigger != last_pass_log_trigger) {
++      last_pass_log_trigger = trigger;
++      gpu_labels::g_pass_log_frames.store(2, std::memory_order_relaxed);
++    }
++    // Per pixel shader draw counts of the previous logged frame (TKPL2 GPU map).
++    static std::unordered_map<uint64_t, std::pair<uint32_t, std::string>> logged_shader_draws;
++    if (!logged_shader_draws.empty()) {
++      std::vector<std::pair<uint32_t, uint64_t>> order;
++      for (const auto& [hash, entry] : logged_shader_draws) order.emplace_back(entry.first, hash);
++      std::sort(order.rbegin(), order.rend());
++      for (size_t i = 0; i < order.size() && i < 60; ++i)
++        gpu_labels::PassLog(fmt::format("PS {:016X} draws={} {}", order[i].second, order[i].first,
++                                        logged_shader_draws[order[i].second].second));
++      logged_shader_draws.clear();
++    }
++    if (gpu_labels::PassLogActive()) {
++      // Depth/stencil state histogram of the frame's draws (LRZ investigation).
++      std::unordered_map<std::string, uint32_t> ds_histogram;
++      for (const NativeCommand& counted : current_frame_) {
++        if (counted.type != CommandType::kDrawPrimitive && counted.type != CommandType::kDrawPrimitiveUp &&
++            counted.type != CommandType::kDrawIndexedPrimitive) continue;
++        const NativeFixedFunctionState& f = counted.fixed_function_state;
++        const NativeShader* ps = counted.pipeline_state ? counted.pipeline_state->pixel_shader_resource : nullptr;
++        const NativeBlendControlState b0 = DecodeNativeBlendControl(f.blend_controls[0]);
++        const NativeBlendControlState b1 = DecodeNativeBlendControl(f.blend_controls[1]);
++        const NativeBlendControlState b2 = DecodeNativeBlendControl(f.blend_controls[2]);
++        const std::string key = fmt::format(
++            "rt={} cwm={:04X} b0={}:{}:{}/{}:{}:{} b1={}:{}:{} b2={}:{}:{} depth={}/{}/w{} stencil={}/{} ops={}:{}:{} ccw={}:{}:{} wm={:02X} ref={} alpha={}/{} blend={} cull={} ps={}",
++            counted.snapshot_render_targets[0].width ? "color" : "none", f.color_write_mask,
++            b0.source_color, b0.destination_color, b0.color_operation, b0.source_alpha, b0.destination_alpha, b0.alpha_operation,
++            b1.source_color, b1.destination_color, b1.color_operation,
++            b2.source_color, b2.destination_color, b2.color_operation,
++            f.depth_enable, uint32_t(ConvertCompareFunction(f.depth_function)), f.depth_write_enable,
++            f.stencil_enable, uint32_t(ConvertCompareFunction(f.stencil_function)),
++            f.stencil_fail, f.stencil_depth_fail, f.stencil_pass,
++            f.ccw_stencil_fail, f.ccw_stencil_depth_fail, f.ccw_stencil_pass,
++            f.stencil_write_mask, f.stencil_reference, f.alpha_test_enable, f.alpha_function,
++            f.blend_enable, f.cull_mode, ps ? (ps->filename.size() > 40 ? ps->filename.substr(ps->filename.size() - 40) : ps->filename) : "none");
++        ++ds_histogram[key];
++      }
++      // State-change log: one line per draw whose key differs from the previous
++      // draw's, with its command index, so Turnip's "at draw N" (counted per
++      // render pass) can be matched against the pass begin lines.
++      {
++        std::string previous_key;
++        uint32_t draw_ordinal = 0;
++        for (size_t index = 0; index < current_frame_.size(); ++index) {
++          const NativeCommand& counted = current_frame_[index];
++          if (counted.type != CommandType::kDrawPrimitive && counted.type != CommandType::kDrawPrimitiveUp &&
++              counted.type != CommandType::kDrawIndexedPrimitive) continue;
++          ++draw_ordinal;
++          const NativeFixedFunctionState& f = counted.fixed_function_state;
++          const NativeShader* ps = counted.pipeline_state ? counted.pipeline_state->pixel_shader_resource : nullptr;
++          const NativeBlendControlState b0 = DecodeNativeBlendControl(f.blend_controls[0]);
++          const std::string key = fmt::format(
++              "cwm={:04X} b0={}:{}:{} depth={}/{}/w{} st={}/{} ops={}:{}:{} wm={:02X} a={} ps={}",
++              f.color_write_mask, b0.source_color, b0.destination_color, b0.color_operation,
++              f.depth_enable, uint32_t(ConvertCompareFunction(f.depth_function)), f.depth_write_enable,
++              f.stencil_enable, uint32_t(ConvertCompareFunction(f.stencil_function)),
++              f.stencil_fail, f.stencil_depth_fail, f.stencil_pass, f.stencil_write_mask, f.alpha_test_enable,
++              ps ? (ps->filename.size() > 28 ? ps->filename.substr(ps->filename.size() - 28) : ps->filename) : "none");
++          if (key != previous_key) {
++            gpu_labels::PassLog(fmt::format("D cmd={} n={} {}", index, draw_ordinal, key));
++            previous_key = key;
++          }
++        }
++      }
++      std::vector<std::pair<uint32_t, std::string>> ds_order;
++      for (auto& [key, count] : ds_histogram) ds_order.emplace_back(count, key);
++      std::sort(ds_order.rbegin(), ds_order.rend());
++      for (size_t i = 0; i < ds_order.size() && i < 80; ++i)
++        gpu_labels::PassLog(fmt::format("DS n={} {}", ds_order[i].first, ds_order[i].second));
++      for (const NativeCommand& counted : current_frame_) {
++        if ((counted.type == CommandType::kDrawPrimitive || counted.type == CommandType::kDrawPrimitiveUp ||
++             counted.type == CommandType::kDrawIndexedPrimitive) &&
++            counted.pipeline_state && counted.pipeline_state->pixel_shader_resource) {
++          auto& entry = logged_shader_draws[counted.pipeline_state->pixel_shader_resource->hash];
++          if (!entry.first++) entry.second = counted.pipeline_state->pixel_shader_resource->filename;
++        }
++      }
++      gpu_labels::PassLog(fmt::format("FRAME frame={} commands={}", submitted_frame, current_frame_.size()));
++      gpu_labels::g_pass_log_frames.fetch_sub(1, std::memory_order_relaxed);
++    }
++  }
+   const uint32_t water_reflection_interval = REXCVAR_GET(gta4_native_water_reflection_interval);
+   bool skip_water_reflection =
+       water_reflection_interval > 1 && submitted_frame % water_reflection_interval != 0;
+@@ -34783,6 +34919,12 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
+       if (rendering) { end_rendering(__LINE__); rendering = false; }
+       if (!ResolveTemporalScene(command_buffer, command, target, resources)) return false;
+     }
++    // This point follows every operation that can end the active pass.
++    if (rendering && draw_command && REXCVAR_GET(gta4_native_extend_rendering_scope) &&
++        !targets_equal(active_target, target) &&
++        BorrowNativeRenderingAttachments(active_target, target)) {
++      g_rendering_scope_borrows.fetch_add(1, std::memory_order_relaxed);
++    }
+     if (!rendering || !targets_equal(active_target, target)) {
+       if (rendering) {
+         // TEMP: classify why consecutive draws split the rendering scope.
+diff --git a/glue/rexglue-sdk-main/src/graphics/gta4_native/native_attachment_policy.h b/glue/rexglue-sdk-main/src/graphics/gta4_native/native_attachment_policy.h
+index c76f71a..8074aa4 100644
+--- a/glue/rexglue-sdk-main/src/graphics/gta4_native/native_attachment_policy.h
++++ b/glue/rexglue-sdk-main/src/graphics/gta4_native/native_attachment_policy.h
+@@ -46,6 +46,56 @@ bool ReuseNativeLightingAttachments(const Target& active, Target& setup) {
+   return true;
+ }
+ 
++// A draw whose realized attachments are a subset of the active scope's (same
++// images, same extent and sample count) keeps that LOAD/STORE scope open: the
++// guest still has the other targets bound, only this draw's write mask skips
++// them. The pipeline is built from the borrowed attachment set with the draw's
++// own write mask (and its own depth/stencil tests, which are off when it had no
++// depth attachment), so untouched attachments keep their tile contents instead
++// of a store + load round trip per attachment-count change (TKPL2, Adreno 643:
++// the g-buffer split into a pass per draw this way).
++template <typename Target>
++bool BorrowNativeRenderingAttachments(const Target& active, Target& draw) {
++  if (active.samples != draw.samples || active.guest_samples != draw.guest_samples ||
++      active.width != draw.width || active.height != draw.height ||
++      active.logical_width != draw.logical_width || active.logical_height != draw.logical_height ||
++      active.uses_presenter || draw.uses_presenter || active.is_reflection || draw.is_reflection ||
++      active.temporal_shader != draw.temporal_shader ||
++      active.temporal_motion != draw.temporal_motion ||
++      active.temporal_reactive != draw.temporal_reactive ||
++      active.temporal_jitter != draw.temporal_jitter) {
++    return false;
++  }
++  if (draw.color_attachment_mask & ~active.color_attachment_mask) return false;
++  for (uint32_t index = 0; index < draw.color_views.size(); ++index) {
++    if ((draw.color_attachment_mask & (1u << index)) == 0) continue;
++    if (draw.color_views[index] != active.color_views[index] ||
++        draw.color_formats[index] != active.color_formats[index] ||
++        draw.color_surfaces[index] != active.color_surfaces[index]) {
++      return false;
++    }
++  }
++  if (draw.depth_stencil_attachment_active) {
++    if (!active.depth_stencil_attachment_active || draw.depth_view != active.depth_view ||
++        draw.depth_format != active.depth_format || draw.depth_surface != active.depth_surface) {
++      return false;
++    }
++  }
++  if (draw.color_attachment_mask == active.color_attachment_mask &&
++      draw.depth_stencil_attachment_active == active.depth_stencil_attachment_active) {
++    return false;  // Nothing to borrow: the normal equality path handles it.
++  }
++  draw.color_surfaces = active.color_surfaces;
++  draw.color_views = active.color_views;
++  draw.color_formats = active.color_formats;
++  draw.color_attachment_mask = active.color_attachment_mask;
++  draw.depth_surface = active.depth_surface;
++  draw.depth_view = active.depth_view;
++  draw.depth_format = active.depth_format;
++  draw.depth_stencil_attachment_active = active.depth_stencil_attachment_active;
++  return true;
++}
++
+ // Calculated from guest state before images are allocated. Inactive bound
+ // descriptors cannot constrain dimensions, sample count, or target families.
+ struct NativeAttachmentUsage {
+diff --git a/glue/rexglue-sdk-main/src/graphics/gta4_native/native_profile_labels.h b/glue/rexglue-sdk-main/src/graphics/gta4_native/native_profile_labels.h
+index bb72954..143ab13 100644
+--- a/glue/rexglue-sdk-main/src/graphics/gta4_native/native_profile_labels.h
++++ b/glue/rexglue-sdk-main/src/graphics/gta4_native/native_profile_labels.h
+@@ -2,8 +2,12 @@
+ 
+ #include "native_gpu_scope_summary_labels.h"
+ 
++#include <atomic>
+ #include <cstdlib>
+ #include <cstring>
++#if defined(__ANDROID__)
++#include <android/log.h>
++#endif
+ #include <string>
+ #include <string_view>
+ #include <utility>
+@@ -76,13 +80,24 @@ inline uint64_t HandleValue(Handle value) {
+   else return uint64_t(value);
+ }
+ 
++// TKPL2 diagnostics: frames left to print every render pass and transfer to
++// logcat (set from the renderer when gta4_native_debug_log_passes changes).
++inline std::atomic<int> g_pass_log_frames{0};
++inline bool PassLogActive() { return g_pass_log_frames.load(std::memory_order_relaxed) > 0; }
++inline void PassLog(const std::string& line) {
++#if defined(__ANDROID__)
++  __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp", "pass: %s", line.c_str());
++#else
++  (void)line;
++#endif
++}
++
+ inline void BeginRendering(const ui::vulkan::VulkanDevice* device,
+                            VkCommandBuffer command, const VkRenderingInfo& info,
+                            const char* operation, uint32_t frame = 0,
+                            uint32_t command_index = 0) {
+-  if (!Enabled() || !device || !command) return;
+-  const auto& api = GetFunctions(device);
+-  if (!api.begin || !api.end) return;
++  const bool log = PassLogActive();
++  if ((!Enabled() && !log) || !device || !command) return;
+   std::string name = fmt::format("GTA4/render/{} frame={} cmd={} extent={}x{} colors={}",
+       operation, frame, command_index, info.renderArea.extent.width,
+       info.renderArea.extent.height, info.colorAttachmentCount);
+@@ -91,12 +106,23 @@ inline void BeginRendering(const ui::vulkan::VulkanDevice* device,
+     name += fmt::format(" c{}={:X}:load{}:store{}", index,
+         HandleValue(attachment.imageView),
+         uint32_t(attachment.loadOp), uint32_t(attachment.storeOp));
++    if (attachment.resolveImageView) name += fmt::format(":resolve{}", uint32_t(attachment.resolveMode));
+   }
+   if (info.pDepthAttachment) {
+     name += fmt::format(" depth={:X}:load{}:store{}",
+         HandleValue(info.pDepthAttachment->imageView),
+         uint32_t(info.pDepthAttachment->loadOp), uint32_t(info.pDepthAttachment->storeOp));
++    if (info.pDepthAttachment->resolveImageView) name += fmt::format(":resolve{}", uint32_t(info.pDepthAttachment->resolveMode));
+   }
++  if (info.pStencilAttachment) {
++    name += fmt::format(" stencil={:X}:load{}:store{}",
++        HandleValue(info.pStencilAttachment->imageView),
++        uint32_t(info.pStencilAttachment->loadOp), uint32_t(info.pStencilAttachment->storeOp));
++  }
++  if (log) PassLog(name);
++  if (!Enabled()) return;
++  const auto& api = GetFunctions(device);
++  if (!api.begin || !api.end) return;
+   Begin(device, command, name.c_str());
+ }
+ 
+@@ -104,7 +130,10 @@ inline void BeginSceneScope(const ui::vulkan::VulkanDevice* device,
+                             VkCommandBuffer command, const VkRenderingInfo& info,
+                             NativeGpuScopeSummary* summary, uint32_t frame,
+                             uint32_t first_command) {
+-  if (!summary || !Available(device, command)) return;
++  if (!summary || !Available(device, command)) {
++    if (PassLogActive()) BeginRendering(device, command, info, "RecordNativeFrame", frame, first_command);
++    return;
++  }
+   summary->Begin(frame, first_command);
+   const auto operation = fmt::format("RecordNativeFrame scope={}", summary->serial());
+   BeginRendering(device, command, info, operation.c_str(), frame, first_command);
+@@ -150,6 +179,7 @@ inline VkShaderModule CreateShader(const ui::vulkan::VulkanDevice* device,
+ template <typename Function>
+ decltype(auto) Transfer(const ui::vulkan::VulkanDevice* device, VkCommandBuffer command,
+                         const char* name, Function&& function) {
++  if (PassLogActive()) PassLog(name);
+   Begin(device, command, name);
+   struct Guard {
+     const ui::vulkan::VulkanDevice* device;
+diff --git a/glue/rexglue-sdk-main/src/graphics/gta4_native/stateful_constant_state.h b/glue/rexglue-sdk-main/src/graphics/gta4_native/stateful_constant_state.h
+index d919e92..a9ba6ee 100644
+--- a/glue/rexglue-sdk-main/src/graphics/gta4_native/stateful_constant_state.h
++++ b/glue/rexglue-sdk-main/src/graphics/gta4_native/stateful_constant_state.h
+@@ -113,8 +113,10 @@ inline bool CaptureConstantPayloadDelta(std::span<const uint8_t> source,
+     } else {
+       result.ranges.push_back({destination_offset, payload_offset, byte_count});
+     }
+-    result.payload.insert(result.payload.end(), source.begin() + destination_offset,
+-                          source.begin() + destination_offset + byte_count);
++    // resize + memcpy: the iterator-range insert did not lower to one copy.
++    const size_t payload_end = result.payload.size();
++    result.payload.resize(payload_end + byte_count);
++    std::memcpy(result.payload.data() + payload_end, source.data() + destination_offset, byte_count);
+   }
+   return ValidateConstantPayloadDelta(result, source.size());
+ }

@@ -1,0 +1,177 @@
+diff --git a/os/android/app/src/main/java/com/libertyrecomp/CrashReports.java b/os/android/app/src/main/java/com/libertyrecomp/CrashReports.java
+index 0269ca2..93468da 100644
+--- a/os/android/app/src/main/java/com/libertyrecomp/CrashReports.java
++++ b/os/android/app/src/main/java/com/libertyrecomp/CrashReports.java
+@@ -35,6 +35,7 @@ final class CrashReports {
+ 
+     private static final String TAG = "LibertyCrash";
+     private static final String PREFS = "crash_reports";
++    private static final String AUTO_START_SEEN = "auto_start_seen_report";
+     private static final String SEEN = "seen_until";
+     private static final String DISMISSED = "dismissed";
+     private static final int KEEP = 10;
+@@ -92,10 +93,44 @@ final class CrashReports {
+                 .putString(DISMISSED, report.file.getName()).apply();
+     }
+ 
+-    private static void collectNew(Context context, File dataRoot, SharedPreferences prefs)
++    /**
++     * Saves reports for exits not seen yet (like {@link #collect}) and tells
++     * whether the game's last session ended in a crash or ANR. The launcher
++     * starts the game on its own unless it did.
++     */
++    static boolean lastSessionCrashed(Context context, File dataRoot) {
++        if (Build.VERSION.SDK_INT < 30) return false;
++        SharedPreferences prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
++        try {
++            collectNew(context, dataRoot, prefs);
++        } catch (Exception e) {
++            Log.w(TAG, "reading exit reasons failed", e);
++        }
++        // Decided from the newest saved report rather than from this call's
++        // findings: onResume collects concurrently and may have saved it first.
++        File[] files = directory(dataRoot).listFiles((d, n) -> n.startsWith("crash-") && n.endsWith(".txt"));
++        if (files == null || files.length == 0) return false;
++        Arrays.sort(files);
++        File newest = files[files.length - 1];
++        if (newest.getName().equals(prefs.getString(AUTO_START_SEEN, ""))) return false;
++        prefs.edit().putString(AUTO_START_SEEN, newest.getName()).apply();
++        String reason = "";
++        String text = read(newest);
++        int start = text.indexOf("reason: ");
++        if (start >= 0) {
++            int end = text.indexOf('\n', start);
++            reason = text.substring(start, end < 0 ? text.length() : end);
++        }
++        return reason.contains(reasonName(ApplicationExitInfo.REASON_CRASH_NATIVE))
++                || reason.contains(reasonName(ApplicationExitInfo.REASON_CRASH))
++                || reason.contains(reasonName(ApplicationExitInfo.REASON_ANR));
++    }
++
++    private static synchronized boolean collectNew(Context context, File dataRoot, SharedPreferences prefs)
+             throws IOException {
+         ActivityManager manager = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+-        if (manager == null) return;
++        if (manager == null) return false;
++        boolean crashed = false;
+         List<ApplicationExitInfo> exits =
+                 manager.getHistoricalProcessExitReasons(context.getPackageName(), 0, 16);
+         long seen = prefs.getLong(SEEN, 0);
+@@ -106,9 +141,14 @@ final class CrashReports {
+             newest = Math.max(newest, exit.getTimestamp());
+             if (!game.equals(exit.getProcessName()) || !abnormal(exit)) continue;
+             write(context, dataRoot, exit);
++            final int reason = exit.getReason();
++            crashed |= reason == ApplicationExitInfo.REASON_CRASH
++                    || reason == ApplicationExitInfo.REASON_CRASH_NATIVE
++                    || reason == ApplicationExitInfo.REASON_ANR;
+         }
+         if (newest != seen) prefs.edit().putLong(SEEN, newest).apply();
+         prune(directory(dataRoot));
++        return crashed;
+     }
+ 
+     /** Crashes, ANRs, failed starts, low-memory kills and non-zero exits; not our own kills. */
+@@ -210,6 +250,17 @@ final class CrashReports {
+         if (trace != null && tombstone != null) {
+             writeFile(new File(dir, "crash-" + stamp + ".tombstone.pb"), trace);
+         }
++        // TKPL2: a copy in the internal files dir, readable over adb with run-as
++        // (the external crash_reports directory is not, without root).
++        try {
++            File internal = new File(context.getFilesDir(), "crash_reports");
++            if (internal.isDirectory() || internal.mkdirs()) {
++                writeFile(new File(internal, "crash-" + stamp + ".txt"),
++                        text.toString().getBytes(StandardCharsets.UTF_8));
++            }
++        } catch (IOException e) {
++            Log.w(TAG, "internal crash report copy failed", e);
++        }
+         Log.i(TAG, "saved " + report + ": " + summary);
+     }
+ 
+diff --git a/os/android/app/src/main/java/com/libertyrecomp/LauncherActivity.java b/os/android/app/src/main/java/com/libertyrecomp/LauncherActivity.java
+index e72269d..932ce37 100644
+--- a/os/android/app/src/main/java/com/libertyrecomp/LauncherActivity.java
++++ b/os/android/app/src/main/java/com/libertyrecomp/LauncherActivity.java
+@@ -20,6 +20,7 @@ import android.util.Log;
+ import android.util.TypedValue;
+ import android.view.Gravity;
+ import android.view.KeyEvent;
++import android.view.MotionEvent;
+ import android.view.View;
+ import android.view.ViewGroup;
+ import android.widget.Button;
+@@ -119,7 +120,60 @@ public class LauncherActivity extends Activity {
+         }, "InstallerLoad").start();
+         // `am start ... --ez play true` (the development scripts) goes
+         // straight into the game with the current driver choice.
+-        if (savedInstanceState == null && getIntent().getBooleanExtra("play", false)) play(false);
++        if (savedInstanceState == null && getIntent().getBooleanExtra("play", false)) {
++            play(false);
++        } else if (savedInstanceState == null) {
++            scheduleAutoStart();
++        }
++    }
++
++    // TKPL2: the launcher starts the game by itself with the current settings
++    // and stays on screen only after a crash (or when the game is not
++    // installed). Any touch or key during the short countdown keeps it open.
++    private static final long AUTO_START_DELAY_MS = 1500;
++    private boolean mAutoStartPending;
++    private final Runnable mAutoStart = this::runAutoStart;
++
++    private void runAutoStart() {
++        if (!mAutoStartPending) return;
++        if (!mInstallerReady) {  // still reading the install state
++            mMain.postDelayed(mAutoStart, 300);
++            return;
++        }
++        mAutoStartPending = false;
++        if (!mInstalled || Installer.running() || mBusy) {
++            refreshStatus();
++            return;
++        }
++        play(false);
++    }
++
++    private void scheduleAutoStart() {
++        new Thread(() -> {
++            boolean crashed = CrashReports.lastSessionCrashed(this, mDataRoot);
++            mMain.post(() -> {
++                if (crashed) {
++                    refreshCrash();  // shows the crash card; no auto-start
++                    return;
++                }
++                mAutoStartPending = true;
++                mStatus.setText("Starting the game... (touch or press any button to stay here)");
++                mMain.postDelayed(mAutoStart, AUTO_START_DELAY_MS);
++            });
++        }, "AutoStart").start();
++    }
++
++    private void cancelAutoStart() {
++        if (!mAutoStartPending) return;
++        mAutoStartPending = false;
++        mMain.removeCallbacks(mAutoStart);
++        refreshStatus();
++    }
++
++    @Override
++    public boolean dispatchTouchEvent(MotionEvent event) {
++        if (event.getActionMasked() == MotionEvent.ACTION_DOWN) cancelAutoStart();
++        return super.dispatchTouchEvent(event);
+     }
+ 
+     @Override
+@@ -1262,6 +1316,10 @@ public class LauncherActivity extends Activity {
+ 
+     @Override
+     public boolean dispatchKeyEvent(KeyEvent event) {
++        if (event.getAction() == KeyEvent.ACTION_DOWN && mAutoStartPending) {
++            cancelAutoStart();
++            return true;
++        }
+         if (event.getAction() == KeyEvent.ACTION_UP) {
+             switch (event.getKeyCode()) {
+                 case KeyEvent.KEYCODE_BUTTON_START:
