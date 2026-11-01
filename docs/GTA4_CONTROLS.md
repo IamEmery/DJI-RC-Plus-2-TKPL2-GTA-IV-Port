@@ -45,17 +45,36 @@ reports both sticks (`ABS_X/Y`, `ABS_RX/RY`, ±32767) and both back wheels
 (`ABS_Z/RZ`, 0-255, centre 127) at about 63 Hz while they move, in games as
 well as on the home screen.
 
-Android does not pass those events on: the input dispatcher shows no motion
-events from the device, neither in the game window nor at the activity level,
-and turning off DJI's "motion via joystick" settings
-(`settings global dji_motion_via_{left,right}_joystick_enabled`) does not
-change that. The bridge already contains the fast path
-(`DjiRcJoystickHandler.onGenericMotion`, wired from
-`LibertyActivity.dispatchGenericMotionEvent`): if those events ever reach the
-app, the sticks and wheels follow the USB gamepad and DUML stays the fallback.
-Each fast axis is compared with DUML on every DUML report, and an axis that
-disagrees for about 0.4 s goes back to DUML for 2 s. The logcat status line
-counts them as `fast events=N fallbacks=N`. Until then the rate stays at 10 Hz.
+By default Android does not pass those events on. DJI's framework
+(`com.dji.comkey.ComKeyManager` in `services.jar`, called from
+`PhoneWindowManager.interceptMotionBeforeQueueing`) intercepts every
+joystick-source motion event and passes it to the focused app only when
+`DjiServicesHelper.enableMotion(package)` agrees. That method says yes when
+the global setting `dji_lab_game_mode` ("DJI Lab game mode") is 1; otherwise
+only DJI's own apps get the events. Turn it on once over adb:
+
+```
+adb shell settings put global dji_lab_game_mode 1
+```
+
+The setting survives reboots. The bridge logs its value at start
+(`installed; dji_lab_game_mode=1 (USB gamepad axes at ~60 Hz)`).
+
+With it on, the bridge's fast path (`DjiRcJoystickHandler.onGenericMotion`,
+wired from `LibertyActivity.dispatchGenericMotionEvent`) receives the
+gamepad's motion events: both sticks and both back wheels follow the USB
+gamepad at up to ~60 Hz, and DUML keeps supplying the buttons. Each fast axis
+is compared with DUML on every DUML report, and an axis that disagrees for
+about 0.4 s goes back to DUML for 2 s. The logcat status line counts them as
+`fast events=N fallbacks=N`; while the sticks move it shows about 200-220
+events per 5 s with 0 fallbacks.
+
+Do not turn off `dji_motion_via_{left,right}_joystick_enabled`: with those
+at 0 the same interceptor drops the stick events instead of passing them.
+
+Buttons still come from DUML at 10 Hz, so a very quick tap can fall between
+two reports; the bridge holds every press for at least 150 ms so the game
+sees it.
 
 ## How it works
 

@@ -51,10 +51,10 @@ index a05ae52..966202e 100644
          // Steady clocks the device can hold, instead of peaks followed by
 diff --git a/os/android/app/src/main/java/org/libsdl/app/DjiRcJoystickHandler.java b/os/android/app/src/main/java/org/libsdl/app/DjiRcJoystickHandler.java
 new file mode 100644
-index 0000000..ce35a47
+index 0000000..4855ce9
 --- /dev/null
 +++ b/os/android/app/src/main/java/org/libsdl/app/DjiRcJoystickHandler.java
-@@ -0,0 +1,536 @@
+@@ -0,0 +1,591 @@
 +package org.libsdl.app;
 +
 +import android.util.Log;
@@ -77,9 +77,11 @@ index 0000000..ce35a47
 + * a client keeps sending a keepalive, but only about 10 per second. The
 + * controller's own USB gamepad ("DJI Virtual Joystick", 2ca3:1501, xpad)
 + * reports the sticks and back wheels at ~60 Hz while they move, so those axes
-+ * come from it; DUML supplies the buttons and is the fallback for any axis the
-+ * gamepad stops tracking (see onFastMotion and checkFastAxes). The six top buttons (L1-L3, R1-R3) arrive separately as F1-F6
-+ * key events from gpio-keys and are forwarded by LibertyActivity.
++ * come from it once DJI's framework lets its events through (global setting
++ * dji_lab_game_mode=1, see GAME_MODE_SETTING); DUML supplies the buttons and
++ * is the fallback for any axis the gamepad stops tracking (see onFastMotion
++ * and fastActive). The six top buttons (L1-L3, R1-R3) arrive separately as
++ * F1-F6 key events from gpio-keys and are forwarded by LibertyActivity.
 + *
 + * Layout (Xbox 360): sticks -> sticks, left/right back wheel -> LT/RT,
 + * C2/C1/R1 -> A/X/Y, C3 -> RB, L1 -> LB, R2 -> B, shutter half -> LT (aim) and
@@ -156,12 +158,31 @@ index 0000000..ce35a47
 +    private final long[] mFastBackoffUntil = new long[6];
 +    private int mFastEvents, mFastFallbacks;
 +
++    /**
++     * DJI's framework (ComKeyManager in services.jar) intercepts the USB
++     * gamepad's motion events before they are queued and passes them to the
++     * focused app only when this global setting is on ("DJI Lab game mode"):
++     * adb shell settings put global dji_lab_game_mode 1. Without it the
++     * sticks fall back to the 10 Hz DUML report.
++     */
++    private static final String GAME_MODE_SETTING = "dji_lab_game_mode";
++
 +    /** Replaces SDL's joystick handler; call after SDLActivity.onCreate. */
 +    public static void install() {
 +        if (sInstance != null) return;
 +        sInstance = new DjiRcJoystickHandler();
 +        SDLControllerManager.mJoystickHandler = sInstance;
-+        Log.i(TAG, "installed");
++        boolean gameMode = false;
++        try {
++            gameMode = android.provider.Settings.Global.getInt(
++                    SDLActivity.getContext().getContentResolver(), GAME_MODE_SETTING, 0) != 0;
++        } catch (RuntimeException e) {
++            Log.w(TAG, "cannot read " + GAME_MODE_SETTING + ": " + e.getMessage());
++        }
++        Log.i(TAG, "installed; " + GAME_MODE_SETTING + "=" + (gameMode ? 1 : 0)
++                + (gameMode ? " (USB gamepad axes at ~60 Hz)"
++                            : " (sticks at 10 Hz via DUML; enable with: adb shell settings put global "
++                              + GAME_MODE_SETTING + " 1)"));
 +    }
 +
 +    /** Forwards an F1-F6 key from the top button row. Returns true if consumed. */
@@ -323,14 +344,16 @@ index 0000000..ce35a47
 +                nextKeepalive = now + KEEPALIVE_MS;
 +            }
 +            updateWheelTap(now);
++            flushReleases(now);
 +            if (now >= mNextStatusLog) {
 +                mNextStatusLog = now + 5000;
 +                Log.i(TAG, "status: rc frames=" + mFrames + " other=" + mOtherFrames
 +                        + " axes=" + java.util.Arrays.toString(mAxes) + " buttons=0x"
 +                        + Integer.toHexString(mDumlButtons | mTopKeys)
 +                        + " fast events=" + mFastEvents + " fallbacks=" + mFastFallbacks
++                        + " short presses=" + mShortPresses
 +                        + " fast=" + java.util.Arrays.toString(mFast));
-+                mFrames = mOtherFrames = mFastEvents = mFastFallbacks = 0;
++                mFrames = mOtherFrames = mFastEvents = mFastFallbacks = mShortPresses = 0;
 +            }
 +            int n;
 +            try {
@@ -438,17 +461,48 @@ index 0000000..ce35a47
 +
 +    private int mDumlButtons;
 +
++    // The game samples the pad once per frame (50-70 ms at 15-20 fps). A tap
++    // shorter than that, or a press and release that arrive in the same DUML
++    // burst, can fall between two frames and be lost, so every press is held
++    // for at least MIN_PRESS_MS. The release is sent by flushReleases().
++    private static final long MIN_PRESS_MS = 150;
++    private final long[] mDownAt = new long[KEYCODES.length];
++    private final boolean[] mReleasePending = new boolean[KEYCODES.length];
++    private int mShortPresses;
++
 +    /** Merges DUML buttons, top keys and the wheel tap, and sends the changes. */
 +    private void applyButtons(int dumlState, boolean fromDuml) {
 +        if (fromDuml) mDumlButtons = dumlState;
 +        int state = mDumlButtons | mTopKeys;
-+        if (System.currentTimeMillis() < mWheelTapUntil) state |= 1 << mWheelDir;
++        long now = System.currentTimeMillis();
++        if (now < mWheelTapUntil) state |= 1 << mWheelDir;
 +        for (int i = 0; i < KEYCODES.length; i++) {
 +            boolean down = (state & (1 << i)) != 0;
-+            if (down != mPressed[i]) {
-+                mPressed[i] = down;
-+                if (down) SDLControllerManager.onNativePadDown(DEVICE_ID, KEYCODES[i], 0);
-+                else SDLControllerManager.onNativePadUp(DEVICE_ID, KEYCODES[i], 0);
++            if (down) mReleasePending[i] = false;
++            if (down == mPressed[i]) continue;
++            if (down) {
++                mPressed[i] = true;
++                mDownAt[i] = now;
++                SDLControllerManager.onNativePadDown(DEVICE_ID, KEYCODES[i], 0);
++            } else if (mConnected && now - mDownAt[i] < MIN_PRESS_MS) {
++                if (!mReleasePending[i]) mShortPresses++;
++                mReleasePending[i] = true;
++            } else {
++                mPressed[i] = false;
++                mReleasePending[i] = false;
++                SDLControllerManager.onNativePadUp(DEVICE_ID, KEYCODES[i], 0);
++            }
++        }
++    }
++
++    /** Sends the releases held back by MIN_PRESS_MS; called from the bridge loop. */
++    private void flushReleases(long now) {
++        synchronized (mLock) {
++            for (int i = 0; i < KEYCODES.length; i++) {
++                if (mReleasePending[i] && now - mDownAt[i] >= MIN_PRESS_MS) {
++                    applyButtons(mDumlButtons, false);
++                    return;
++                }
 +            }
 +        }
 +    }
@@ -543,6 +597,7 @@ index 0000000..ce35a47
 +        synchronized (mLock) {
 +            mWheelTapUntil = 0;
 +            mShutterHalf = mShutterFull = false;
++            java.util.Arrays.fill(mDownAt, 0);  // release now, no minimum hold
 +            applyButtons(0, true);
 +            for (int i = 0; i < 6; i++) setAxis(i, i < 4 ? 0f : -1f);
 +        }

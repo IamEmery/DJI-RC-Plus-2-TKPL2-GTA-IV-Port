@@ -36,7 +36,7 @@ The controller-side work is in the companion repository
 | What limits it | the GPU (~47–50 ms per street frame, bandwidth-bound); then the title's submit thread (~41–44 ms) |
 | Audio | stable after patch 0004 |
 | Stability | known race guarded at four sites; one open write fault ([STABILITY.md](docs/STABILITY.md)) |
-| Input rate | 10 Hz, set by the DJI service; the RC's USB gamepad reports ~63 Hz but Android does not deliver its events ([details](docs/GTA4_CONTROLS.md#input-rate)) |
+| Input rate | sticks and back wheels ~60 Hz from the RC's USB gamepad once `dji_lab_game_mode` is on; buttons 10 Hz via DUML ([details](docs/GTA4_CONTROLS.md#input-rate)) |
 
 All performance work followed one rule: **no quality reductions.** Draw distance, densities and
 shadows stay at the port authors' defaults. [PERFORMANCE.md](docs/PERFORMANCE.md) lists what was
