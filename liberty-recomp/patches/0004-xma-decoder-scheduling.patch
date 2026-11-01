@@ -1,5 +1,119 @@
+diff --git a/glue/rexglue-sdk-main/src/audio/audio_system.cpp b/glue/rexglue-sdk-main/src/audio/audio_system.cpp
+index 49affc3..55c0fd2 100644
+--- a/glue/rexglue-sdk-main/src/audio/audio_system.cpp
++++ b/glue/rexglue-sdk-main/src/audio/audio_system.cpp
+@@ -17,6 +17,8 @@
+ #endif
+ #include <algorithm>
+ #include <array>
++#include <atomic>
++#include <chrono>
+ #include <optional>
+ #include <rex/assert.h>
+ #include <rex/audio/audio_driver.h>
+@@ -64,6 +66,12 @@ REXCVAR_DEFINE_INT32(
+ 
+ namespace rex::audio {
+ 
++namespace {
++// Frames the guest submitted; the worker compares it around each mixer
++// callback to see which callbacks produced nothing.
++std::atomic<uint32_t> g_submitted_frames{0};
++}  // namespace
++
+ AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
+     : memory_(function_dispatcher->memory()),
+       function_dispatcher_(function_dispatcher),
+@@ -211,8 +219,32 @@ void AudioSystem::WorkerThreadMain() {
+             client_callback_arg);
+         handoff::Span handoff_callback("guest-mixer", index, client_callback, client_callback_arg);
+         uint64_t args[] = {client_callback_arg};
++        // Per-10 s shape of the producer: callbacks, how many submitted no
++        // frame, the slowest callback and the longest gap between two.
++        using clock = std::chrono::steady_clock;
++        static uint32_t cb_count = 0, cb_empty = 0;
++        static int64_t cb_max_us = 0, gap_max_us = 0;
++        static clock::time_point last_end{}, next_report = clock::now() + std::chrono::seconds(10);
++        const auto t0 = clock::now();
++        if (last_end != clock::time_point{}) {
++          gap_max_us = std::max<int64_t>(
++              gap_max_us, std::chrono::duration_cast<std::chrono::microseconds>(t0 - last_end).count());
++        }
++        const uint32_t submitted_before = g_submitted_frames.load(std::memory_order_relaxed);
+         function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
+                                       rex::countof(args));
++        last_end = clock::now();
++        ++cb_count;
++        if (g_submitted_frames.load(std::memory_order_relaxed) == submitted_before) ++cb_empty;
++        cb_max_us = std::max<int64_t>(
++            cb_max_us, std::chrono::duration_cast<std::chrono::microseconds>(last_end - t0).count());
++        if (last_end >= next_report) {
++          REXAPU_WARN("audio-producer: {} callbacks, {} without a frame, slowest {} us, longest gap {} us",
++                      cb_count, cb_empty, cb_max_us, gap_max_us);
++          cb_count = cb_empty = 0;
++          cb_max_us = gap_max_us = 0;
++          next_report = last_end + std::chrono::seconds(10);
++        }
+         diagnostics::gta4_transition::RecordSteady(
+             diagnostics::gta4_transition::EventSource::kAudio,
+             diagnostics::gta4_transition::EventType::kAudioCallbackEnd,
+@@ -365,6 +397,7 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
+       diagnostics::gta4_transition::EventSource::kAudio,
+       diagnostics::gta4_transition::EventType::kAudioSubmit, 0, 0, 0,
+       diagnostics::gta4_transition::kFlagBefore, index, samples_ptr);
++  g_submitted_frames.fetch_add(1, std::memory_order_relaxed);
+   driver->SubmitFrame(samples_ptr);
+ }
+ 
+diff --git a/glue/rexglue-sdk-main/src/audio/sdl/sdl_audio_driver.cpp b/glue/rexglue-sdk-main/src/audio/sdl/sdl_audio_driver.cpp
+index 3e2946c..98cbc19 100644
+--- a/glue/rexglue-sdk-main/src/audio/sdl/sdl_audio_driver.cpp
++++ b/glue/rexglue-sdk-main/src/audio/sdl/sdl_audio_driver.cpp
+@@ -290,20 +290,30 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+   // producer from an output-side problem.
+   static uint32_t silent_fills = 0;
+   static uint32_t filled = 0;
++  // Shape of the gaps: how many separate silence runs, the longest run, and
++  // the shallowest queue seen while frames were still available.
++  static uint32_t silent_run = 0, silent_run_max = 0, silent_runs = 0;
++  static size_t min_depth = SIZE_MAX;
+   static auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+   while (additional_amount > 0) {
+     static uint32_t sdl_callback_count = 0;
+     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
+     if (const auto now = std::chrono::steady_clock::now(); now >= next_report) {
+       if (silent_fills) {
+-        REXAPU_WARN("audio: {} of {} blocks were silence (no guest frame ready), {} queued",
+-                    silent_fills, silent_fills + filled, driver->frames_queued_.size());
++        REXAPU_WARN(
++            "audio: {} of {} blocks were silence (no guest frame ready), {} queued; {} runs, "
++            "longest {} blocks, min depth {}",
++            silent_fills, silent_fills + filled, driver->frames_queued_.size(), silent_runs,
++            silent_run_max, min_depth == SIZE_MAX ? 0 : min_depth);
+       }
+-      silent_fills = filled = 0;
++      silent_fills = filled = silent_run_max = silent_runs = 0;
++      min_depth = SIZE_MAX;
+       next_report = now + std::chrono::seconds(10);
+     }
+     if (driver->frames_queued_.empty()) {
+       ++silent_fills;
++      if (silent_run++ == 0) ++silent_runs;
++      silent_run_max = std::max(silent_run_max, silent_run);
+       if (sdl_callback_count < 10) {
+         REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
+         sdl_callback_count++;
+@@ -316,6 +326,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+       additional_amount -= len;
+     } else {
+       ++filled;
++      silent_run = 0;
++      min_depth = std::min(min_depth, driver->frames_queued_.size());
+       auto buffer = driver->frames_queued_.front();
+       driver->frames_queued_.pop();
+       if (REXCVAR_GET(audio_mute)) {
 diff --git a/glue/rexglue-sdk-main/src/audio/xma_decoder.cpp b/glue/rexglue-sdk-main/src/audio/xma_decoder.cpp
-index 1cf45ea..a4da1f9 100644
+index 1cf45ea..a0d9cf9 100644
 --- a/glue/rexglue-sdk-main/src/audio/xma_decoder.cpp
 +++ b/glue/rexglue-sdk-main/src/audio/xma_decoder.cpp
 @@ -10,7 +10,10 @@
@@ -13,7 +127,57 @@ index 1cf45ea..a4da1f9 100644
  #include <android/log.h>
  #include <cerrno>
  #include <unistd.h>
-@@ -157,6 +160,40 @@ void XmaDecoder::WorkerThreadMain() {
+@@ -37,6 +40,49 @@ extern "C" {
+ }  // extern "C"
+ 
+ REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debug and above)");
++REXCVAR_DEFINE_BOOL(audio_engine_prime_core, true, "Audio",
++                    "Android: keep the title's audio engine thread (the one that kicks XMA) on the "
++                    "cores with the highest maximum clock. Its mixing is CPU-bound and a slow block "
++                    "becomes silence; the prime core is ~13 % faster than the other big cores on "
++                    "QCS5430")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
++#if defined(__ANDROID__)
++namespace {
++// Pins the calling thread to the cores whose cpuinfo_max_freq is the highest
++// (fastest_only) or above the slowest cluster's. Returns the core count or 0.
++int PinToFastCores(bool fastest_only, const char* who) {
++  long slowest = 0, fastest = 0;
++  std::vector<std::pair<int, long>> cores;
++  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
++    char path[96];
++    std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
++    FILE* file = std::fopen(path, "r");
++    if (!file) break;
++    long frequency = 0;
++    if (std::fscanf(file, "%ld", &frequency) != 1) frequency = 0;
++    std::fclose(file);
++    cores.emplace_back(cpu, frequency);
++    if (frequency && (!slowest || frequency < slowest)) slowest = frequency;
++    if (frequency > fastest) fastest = frequency;
++  }
++  cpu_set_t set;
++  CPU_ZERO(&set);
++  int count = 0;
++  for (const auto& [cpu, frequency] : cores) {
++    if (fastest_only ? frequency == fastest : frequency > slowest) {
++      CPU_SET(cpu, &set);
++      ++count;
++    }
++  }
++  if (!count || count == static_cast<int>(cores.size())) return 0;
++  const int result = sched_setaffinity(gettid(), sizeof(set), &set);
++  __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp", "audio-affinity %s cores=%d result=%d",
++                      who, count, result);
++  return result ? 0 : count;
++}
++}  // namespace
++#endif
+ 
+ // As with normal Microsoft, there are like twelve different ways to access
+ // the audio APIs. Early games use XMA*() methods almost exclusively to touch
+@@ -157,6 +203,40 @@ void XmaDecoder::WorkerThreadMain() {
      __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp", "audio-priority %s tid=%d result=%d errno=%d",
                          "xma_decoder.cpp", int(gettid()), result, result ? errno : 0);
    }
@@ -54,7 +218,7 @@ index 1cf45ea..a4da1f9 100644
  #endif
    while (worker_running_) {
      // Process only contexts made ready by a kick instead of scanning all 320
-@@ -321,6 +358,19 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+@@ -321,6 +401,22 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
    register_file_[r] = value;
  
    if (r >= XmaRegister::Context0Kick && r <= XmaRegister::Context9Kick) {
@@ -69,8 +233,27 @@ index 1cf45ea..a4da1f9 100644
 +      const int result = setpriority(PRIO_PROCESS, gettid(), -16);
 +      __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp", "audio-priority %s tid=%d result=%d errno=%d",
 +                          "guest-audio-engine", int(gettid()), result, result ? errno : 0);
++      // Its per-block mixing runs at 50-70 % of a big core and the slow
++      // blocks (17-27 ms for a 5.3 ms block) drain the output queue.
++      if (REXCVAR_GET(audio_engine_prime_core)) PinToFastCores(true, "guest-audio-engine");
 +    }
 +#endif
      handoff::Span handoff_kick("xma-kick", r, value);
      // Context kick command.
      // This will kick off the given hardware contexts.
+diff --git a/glue/rexglue-sdk-main/src/kernel/xboxkrnl/xboxkrnl_audio.cpp b/glue/rexglue-sdk-main/src/kernel/xboxkrnl/xboxkrnl_audio.cpp
+index 876d813..82fe20b 100644
+--- a/glue/rexglue-sdk-main/src/kernel/xboxkrnl/xboxkrnl_audio.cpp
++++ b/glue/rexglue-sdk-main/src/kernel/xboxkrnl/xboxkrnl_audio.cpp
+@@ -33,7 +33,10 @@ u32 XAudioGetSpeakerConfig_entry(mapped_u32 config_ptr) {
+ u32 XAudioGetVoiceCategoryVolumeChangeMask_entry(mapped_void driver_ptr, mapped_u32 out_ptr) {
+   assert_true((driver_ptr.guest_address() & 0xFFFF0000) == 0x41550000);
+ 
+-  rex::thread::Sleep(std::chrono::microseconds(1));
++  // The title's audio engine calls this once per output block. A 1 us Sleep
++  // here really takes 0.2-0.3 ms on Android (timer slack + wakeup), which was
++  // 5 % of the engine thread's time on TKPL2; yield instead, as xenia does.
++  rex::thread::MaybeYield();
+ 
+   // Checking these bits to see if any voice volume changed.
+   // I think.

@@ -68,6 +68,43 @@ third of all output.
 **Result:** while driving, N fell from 300–800 to 0–50 per 10 s, and is mostly 0. The frame rate did
 not change measurably.
 
+### Round 2: short dropouts
+
+**Symptom:** after the fix above, driving with the radio on and shooting still crackled: N was
+30–180 per 10 s.
+
+**Diagnosis.** Two counters were added to see the shape of the gaps. The driver's line now ends
+with `; R runs, longest L blocks, min depth D`, and the Audio Worker logs
+`audio-producer: C callbacks, E without a frame, slowest S us, longest gap G us` every 10 s.
+They showed 25–135 separate runs of only 2–3 blocks (10–16 ms) per 10 s, the queue dropping to
+depth 1, no callback ever returning without a frame, but the slowest callback taking 17–27 ms for
+a 5.3 ms block. An off-CPU profile (`simpleperf record --app com.libertyrecomp --trace-offcpu`;
+plain shell `simpleperf` is denied `perf_event_open` on this firmware) of the engine thread, the
+XMA decoder and the SDL audio thread found no wait longer than 15 ms in 40 s. So nothing stalls:
+the title's audio engine thread is simply CPU-bound, at 50–72 % of a big core on average with
+peaks over 100 %, and every slow block costs the output queue its lead.
+
+Two host-side losses on that thread were measurable:
+- `XAudioGetVoiceCategoryVolumeChangeMask` (called once per block, 180/s) did
+  `Sleep(1 us)`, which on Android takes 0.2–0.3 ms with timer slack: 5 % of the thread's time.
+- The thread floated over the four big cores; the prime core runs at 2.7 GHz against 2.4 GHz for
+  the other three.
+
+**Fix:**
+- `src/kernel/xboxkrnl/xboxkrnl_audio.cpp`: the sleep becomes `MaybeYield()`, as in xenia.
+- `src/audio/xma_decoder.cpp`: the engine thread is pinned to the cores with the highest
+  `cpuinfo_max_freq` the first time it kicks XMA (cvar `audio_engine_prime_core`, default on;
+  logged as `audio-affinity guest-audio-engine cores=1`).
+
+**Result:** over three minutes of the same driving and shooting, 15 of 18 ten-second periods had no
+silence at all; the other three had 31, 1 and 2 blocks (before: 30–180 in most periods). The
+queue now stays 18–32 frames deep. The slowest callback is unchanged (20–26 ms), so a heavier
+mix could still run short; the counters above show it if so.
+
+Not related to the game: the audio HAL logs `out_write: underrun` every 5–10 s (a ~4 ms gap in
+AudioFlinger's fast mixer). SDL's own `Audio playback underflow` never fires, so the app always
+delivered its data in time; this is left as is.
+
 ## Launcher auto-start
 `LauncherActivity` starts the game on its own 1.5 s after launch, under these conditions:
 - the game is installed;
