@@ -22,7 +22,7 @@ The controller-side work is in the companion repository
 |---|---|---|
 | `0001-dji-rc-plus2-controls` | The RC's sticks, wheels and buttons as an SDL gamepad, read over DUML; the top buttons arrive as F1–F6 | all controls work in game ([layout](docs/GTA4_CONTROLS.md)) |
 | `0002-launcher-autostart-and-crash-reports` | The game starts by itself unless the last session crashed; crash reports readable over adb | verified on the RC |
-| `0003-stale-object-guards` | Guards against a title-side use-after-free race in the entity walk | four crash sites fixed ([details](docs/STABILITY.md)) |
+| `0003-stale-object-guards` | Guards against a title-side use-after-free race in the entity walk, applied to generated code by `tools/apply_generated_patches.py` so they survive regeneration | four crash sites fixed ([details](docs/STABILITY.md)) |
 | `0004-xma-decoder-scheduling` | XMA audio decoder kept off the slow cores; the game's audio engine at audio priority on the prime core; a per-block sleep in an XAudio call removed | audio dropouts while driving 300–800 → 0–50 → mostly 0 blocks per 10 s ([details](docs/STABILITY.md#audio-stutter)) |
 | `0005-renderer-optimizations-and-diagnostics` | Render-pass merging, cheaper command capture, an optional lock spin (default off), pass and state diagnostics | see [PERFORMANCE.md](docs/PERFORMANCE.md) |
 | `0006-vulkan-proxy-qualcomm-shaderint64` | Research: `shaderInt64` on one proprietary Qualcomm driver build; inactive with Turnip | see [QUALCOMM_DRIVER.md](docs/QUALCOMM_DRIVER.md) |
@@ -45,9 +45,11 @@ measured, including the ideas that did not help.
 ## Quick start
 
 1. Get ADB access to the controller ([HARDWARE.md](docs/HARDWARE.md)).
-2. Build LibertyRecompAndroid v0.5.9.3 with `liberty-recomp/patches/`
+2. Download the APK from [Releases](https://github.com/IamEmery/DJI-RC-Plus-2-TKPL2-GTA-IV-Port/releases),
+   or build LibertyRecompAndroid v0.5.9.3 with `liberty-recomp/patches/` yourself
    ([BUILDING.md](docs/BUILDING.md); profile-guided optimization recommended).
-3. Install the APK. Put your disc image and Title Update 8 into
+3. Install the APK (uninstall the upstream app first: the signing keys differ, and uninstalling
+   deletes `Android/data/com.libertyrecomp`, so copy your saves away). Put your disc image and Title Update 8 into
    `Android/data/com.libertyrecomp/files/install/` and install them from the launcher.
 4. In `Android/data/com.libertyrecomp/files/env.txt`, set `TU_DEBUG=` (empty). That lets Turnip
    choose GMEM or sysmem per render pass, which is 15 % faster on the Adreno 643 than the app's
